@@ -5,7 +5,7 @@ use oxideav_core::{ColorRange, ColorSignal, PixelFormat};
 use rvideoplayer::engine::{Picture, Player, Track};
 
 use super::{
-    controls::{Icon, action_icon, timestamp},
+    controls::{Icon, PANEL_BACKGROUND, PANEL_BORDER, action_icon, timestamp},
     library::title,
     overlays::Clock,
     preferences::{ClickAction, ClockSize, MouseSettings, WHEEL_SEEK_RANGE},
@@ -57,8 +57,8 @@ pub fn show(
         .backdrop_color(Color32::from_black_alpha(142))
         .frame(
             Frame::new()
-                .fill(Color32::from_rgb(24, 29, 41))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(67, 79, 101)))
+                .fill(PANEL_BACKGROUND)
+                .stroke(Stroke::new(1.0, PANEL_BORDER))
                 .corner_radius(13.0)
                 .inner_margin(16.0),
         )

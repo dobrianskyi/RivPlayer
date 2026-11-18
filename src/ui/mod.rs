@@ -37,8 +37,8 @@ use preview::Preview;
 use sidebar::{Action, QueueItem, Sidebar};
 
 use controls::{
-    Icon, PlaybackCue, RED, WHITE, button, draw, gradient, named_button, seekbar, timestamp,
-    volume_slider,
+    Icon, PANEL_BACKGROUND, PANEL_BORDER, PlaybackCue, RED, WHITE, button, draw, gradient,
+    named_button, seekbar, timestamp, volume_slider,
 };
 use layout::Layout;
 use learning::{Command as Learn, Learning};
@@ -241,7 +241,10 @@ impl App {
             .or_default()
             .insert(0, "Roboto".to_owned());
         cc.egui_ctx.set_fonts(fonts);
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        let mut visuals = egui::Visuals::dark();
+        visuals.window_fill = PANEL_BACKGROUND;
+        visuals.window_stroke = egui::Stroke::new(1.0, PANEL_BORDER);
+        cc.egui_ctx.set_visuals(visuals);
         let title_icon = cc.egui_ctx.load_texture(
             "rvideoplayer-icon",
             egui::ColorImage::from_rgba_unmultiplied(
@@ -1246,7 +1249,7 @@ impl App {
             });
         if self.volume_open {
             if !inline_volume {
-                p.rect_filled(volume_rect, 6.0, Color32::from_rgb(25, 29, 40));
+                p.rect_filled(volume_rect, 6.0, PANEL_BACKGROUND);
             }
             let wheel = if ui.input(|i| {
                 i.pointer
@@ -1339,7 +1342,7 @@ impl App {
                 pos2(center - margin, track.top() - height - 8.0),
                 vec2(width, height),
             );
-            p.rect_filled(card, 6.0, Color32::from_rgb(25, 29, 40));
+            p.rect_filled(card, 6.0, PANEL_BACKGROUND);
             if let Some(image) = image {
                 let thumb =
                     Rect::from_min_max(card.min + vec2(4.0, 4.0), card.max - vec2(4.0, 23.0));
@@ -1532,11 +1535,7 @@ impl App {
             .show(ctx, |ui| {
                 let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::click());
                 let p = ui.painter();
-                p.rect_filled(
-                    rect,
-                    CornerRadius::same(12),
-                    Color32::from_rgba_unmultiplied(32, 32, 32, 242),
-                );
+                p.rect_filled(rect, CornerRadius::same(12), PANEL_BACKGROUND);
                 if !title.is_empty() {
                     let label = Rect::from_min_size(rect.min, vec2(width, top));
                     let resp = ui

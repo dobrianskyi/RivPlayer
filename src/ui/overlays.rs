@@ -6,7 +6,7 @@ use eframe::egui::{
 };
 
 use super::{
-    controls::{Icon, draw_scaled},
+    controls::{Icon, PANEL_BACKGROUND, PANEL_BORDER, WHITE, draw_scaled},
     preferences::{ClockSize, OverlayPosition},
 };
 
@@ -257,12 +257,9 @@ impl Clock {
             .min(video.height() / 220.0)
             .clamp(0.48, 1.0);
         let painter = ui.painter();
-        let title = painter.layout_no_wrap(
-            "Alarm".into(),
-            FontId::proportional(42.0 * scale),
-            Color32::WHITE,
-        );
-        let detail_color = Color32::from_rgb(212, 218, 230);
+        let title =
+            painter.layout_no_wrap("Alarm".into(), FontId::proportional(42.0 * scale), WHITE);
+        let detail_color = Color32::from_gray(216);
         let detail = painter.layout_no_wrap(
             format!("Playback paused · {minutes} min"),
             FontId::proportional(18.0 * scale),
@@ -273,26 +270,19 @@ impl Clock {
             title.size().y + detail.size().y + 116.0 * scale,
         );
         let card = Rect::from_center_size(video.center(), size);
-        painter.rect_filled(card, 15.0, Color32::from_rgba_unmultiplied(24, 28, 39, 242));
+        painter.rect_filled(card, 15.0, PANEL_BACKGROUND);
         painter.rect_stroke(
             card,
             15.0,
-            Stroke::new(1.0, Color32::from_white_alpha(40)),
+            Stroke::new(1.0, PANEL_BORDER),
             StrokeKind::Inside,
         );
         let badge = pos2(card.center().x, card.top() + 48.0 * scale);
-        painter.circle_filled(badge, 30.0 * scale, Color32::from_rgb(64, 49, 34));
-        draw_scaled(
-            painter,
-            badge,
-            Icon::Alarm,
-            Color32::from_rgb(255, 195, 111),
-            1.9 * scale,
-        );
+        draw_scaled(painter, badge, Icon::Alarm, WHITE, 1.9 * scale);
         let top = badge.y + 39.0 * scale;
         let centered_x = |width| card.center().x - width * 0.5;
         let detail_top = top + title.size().y + 6.0 * scale;
-        painter.galley(pos2(centered_x(title.size().x), top), title, Color32::WHITE);
+        painter.galley(pos2(centered_x(title.size().x), top), title, WHITE);
         painter.galley(
             pos2(centered_x(detail.size().x), detail_top),
             detail,

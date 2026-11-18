@@ -7,6 +7,8 @@ use eframe::egui::{
 
 pub const RED: Color32 = Color32::from_rgb(255, 0, 51);
 pub const WHITE: Color32 = Color32::from_gray(245);
+pub const PANEL_BACKGROUND: Color32 = Color32::from_gray(32);
+pub const PANEL_BORDER: Color32 = Color32::from_gray(63);
 pub const ACTION_WIDTH: f32 = 27.0;
 
 #[derive(Clone, Copy)]
