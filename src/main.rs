@@ -4,7 +4,7 @@ mod ui;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail, ensure};
-use rvideoplayer::engine::{DecodeMode, Options};
+use rivplayer::engine::{DecodeMode, Options};
 
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
@@ -17,7 +17,7 @@ fn main() -> Result<()> {
         match arg.to_str().filter(|_| !literal) {
             Some("--help" | "-h") => {
                 println!(
-                    "RVideoPlayer [--software | --vaapi] [FILE]\nRVideoPlayer --check [--software | --vaapi] [--seek SECONDS] [--video-track ID] [--audio-track ID] FILE…"
+                    "RivPlayer [--software | --vaapi] [FILE]\nRivPlayer --check [--software | --vaapi] [--seek SECONDS] [--video-track ID] [--audio-track ID] FILE…"
                 );
                 return Ok(());
             }

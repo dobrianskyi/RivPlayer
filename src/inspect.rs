@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::atomic::AtomicBool};
 
 use anyhow::{Context, Result, ensure};
-use rvideoplayer::{
+use rivplayer::{
     engine::{self, Event, Options},
     source::LocalFile,
 };

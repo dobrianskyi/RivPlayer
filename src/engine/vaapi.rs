@@ -217,50 +217,50 @@ fn read(
     let mut y = vec![0; y_stride * height as usize];
     let mut uv = vec![0; uv_stride * height.div_ceil(2) as usize];
     copy(&mut Planes::new(&mut y, y_stride, &mut uv, uv_stride))?;
-    let mut planes = Vec::with_capacity(3);
-    let format = if bits == 8 {
-        planes.push(VideoPlane {
+    let planes = vec![
+        VideoPlane {
             stride: y_stride,
             data: y,
-        });
-        planes.push(VideoPlane {
+        },
+        VideoPlane {
             stride: uv_stride,
             data: uv,
-        });
-        PixelFormat::Nv12
-    } else {
-        // VA-API P010 stores MSB-aligned samples. The renderer accepts
-        // the same LSB-aligned planar format as the software decoder.
-        for word in y.as_chunks_mut::<2>().0 {
-            let sample = u16::from_le_bytes([word[0], word[1]]) >> 6;
-            word.copy_from_slice(&sample.to_le_bytes());
-        }
-        let mut u = Vec::with_capacity(uv.len() / 2);
-        let mut v = Vec::with_capacity(uv.len() / 2);
-        for pair in uv.as_chunks::<4>().0 {
-            u.extend_from_slice(&(u16::from_le_bytes([pair[0], pair[1]]) >> 6).to_le_bytes());
-            v.extend_from_slice(&(u16::from_le_bytes([pair[2], pair[3]]) >> 6).to_le_bytes());
-        }
-        planes.push(VideoPlane {
-            stride: y_stride,
-            data: y,
-        });
-        planes.push(VideoPlane {
-            stride: uv_stride / 2,
-            data: u,
-        });
-        planes.push(VideoPlane {
-            stride: uv_stride / 2,
-            data: v,
-        });
-        PixelFormat::Yuv420P10Le
-    };
+        },
+    ];
     Ok(Picture {
         timestamp: pts,
         width,
         height,
-        format,
+        format: PixelFormat::Nv12,
+        p010: bits == 10,
         color,
         frame: VideoFrame { pts, planes },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn p010_keeps_msb_aligned_samples_and_interleaved_uv() -> Result<()> {
+        let luma = (300u16 << 6).to_le_bytes();
+        let u = (400u16 << 6).to_le_bytes();
+        let v = (600u16 << 6).to_le_bytes();
+        let picture = read(3, 3, 10, None, ColorSignal::default(), |out| {
+            assert_eq!(out.luma_stride, 6);
+            assert_eq!(out.chroma_stride, 8);
+            out.luma[..2].copy_from_slice(&luma);
+            out.chroma[..4].copy_from_slice(&[u, v].concat());
+            Ok(())
+        })?;
+        let planes = picture.frame.image_planes();
+        assert!(picture.p010);
+        assert_eq!(planes.len(), 2);
+        assert_eq!(planes[0].data.len(), 18);
+        assert_eq!(planes[1].data.len(), 16);
+        assert_eq!(&planes[0].data[..2], &luma);
+        assert_eq!(&planes[1].data[..4], &[u, v].concat());
+        Ok(())
+    }
 }

@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=RivPlayer
+GenericName=Media Player
+GenericName[ru]=Медиаплеер
+Comment=Play local video and audio files
+Comment[ru]=Воспроизведение локальных видео и аудио
+Exec=/usr/bin/rivplayer -- %f
+TryExec=/usr/bin/rivplayer
+Icon=rivplayer
+Terminal=false
+StartupNotify=true
+StartupWMClass=rivplayer
+Categories=AudioVideo;Video;Player;
+MimeType=video/mp4;video/quicktime;video/matroska;video/x-matroska;video/webm;video/vnd.avi;video/x-msvideo;video/mp2t;video/mpeg;video/x-flv;video/ogg;video/x-theora+ogg;video/3gpp;

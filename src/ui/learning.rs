@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use eframe::egui::{self, Color32, FontId, Rect, Sense, Stroke, pos2, vec2};
-use rvideoplayer::engine::{Captions, Cue, Player, Repeat, active_cue};
+use rivplayer::engine::{Captions, Cue, Player, Repeat, active_cue};
 
 use super::preferences::MediaSettings;
 

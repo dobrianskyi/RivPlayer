@@ -5,10 +5,9 @@ use std::{
 };
 
 use anyhow::Result;
-use eframe::egui::{self, Color32, Stroke, StrokeKind};
+use eframe::egui::{self, Color32, Stroke};
 
 use super::{
-    controls::{Icon, action_icon},
     file_manager, learning,
     library::{DEFAULT_PLAYLIST, Entry, Library, List, Playlist},
     library_rows::{Edit, MenuState, Rows},
@@ -44,19 +43,13 @@ pub struct Sidebar {
     playlist_name: String,
     renaming: bool,
     edit_focused: bool,
+    queue_availability: Option<(QueueItem, u64, (bool, bool))>,
     reveal_error: (mpsc::Sender<String>, mpsc::Receiver<String>),
     pub error: Option<String>,
 }
 
 impl Sidebar {
-    pub fn new(ctx: egui::Context) -> Result<Self> {
-        let (db, error) = match Library::open() {
-            Ok(db) => (db, None),
-            Err(err) => (
-                Library::temporary()?,
-                Some(format!("Temporary library · {err:#}")),
-            ),
-        };
+    pub fn new(ctx: egui::Context, db: Library, error: Option<String>) -> Result<Self> {
         let view = db.sidebar_view()?;
         Ok(Self {
             db,
@@ -72,6 +65,7 @@ impl Sidebar {
             playlist_name: String::new(),
             renaming: false,
             edit_focused: false,
+            queue_availability: None,
             reveal_error: mpsc::channel(),
         })
     }
@@ -128,21 +122,42 @@ impl Sidebar {
         Ok(first.map(|item| QueueItem { playlist, item }))
     }
 
-    pub fn next(&self, current: QueueItem) -> Result<Option<(PathBuf, QueueItem)>> {
-        let items = self.db.entries(List::Playlist(current.playlist))?;
-        Ok(items
-            .iter()
-            .position(|i| i.id == current.item)
-            .and_then(|index| items.get(index + 1))
-            .map(|item| {
+    pub fn adjacent(
+        &self,
+        current: QueueItem,
+        forward: bool,
+    ) -> Result<Option<(PathBuf, QueueItem)>> {
+        Ok(self
+            .db
+            .adjacent_playlist_item(current.playlist, current.item, forward)?
+            .map(|(path, item)| {
                 (
-                    item.path.clone(),
+                    path,
                     QueueItem {
                         playlist: current.playlist,
-                        item: item.id,
+                        item,
                     },
                 )
             }))
+    }
+
+    pub fn queue_availability(&mut self, current: Option<QueueItem>) -> Result<(bool, bool)> {
+        let Some(current) = current else {
+            return Ok((false, false));
+        };
+        let revision = self.db.revision();
+        if let Some((last, cached, available)) = self.queue_availability
+            && current == last
+            && revision == cached
+        {
+            return Ok(available);
+        }
+        let available = (
+            self.adjacent(current, true)?.is_some(),
+            self.adjacent(current, false)?.is_some(),
+        );
+        self.queue_availability = Some((current, revision, available));
+        Ok(available)
     }
 
     fn record(&mut self, result: Result<()>) {
@@ -231,50 +246,8 @@ impl Sidebar {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.tab, Tab::History, "History");
                     ui.selectable_value(&mut self.tab, Tab::Playlist, "Playlist");
-                    let star = action_icon(ui, Icon::Star, "Favorites", true);
-                    if star.clicked() {
-                        self.tab = Tab::Favorites;
-                    }
-                    if self.tab == Tab::Favorites {
-                        ui.painter().rect_stroke(
-                            star.rect,
-                            5.0,
-                            Stroke::new(1.0, Color32::from_rgb(129, 159, 218)),
-                            StrokeKind::Inside,
-                        );
-                    }
+                    ui.selectable_value(&mut self.tab, Tab::Favorites, "Favorites");
                     ui.selectable_value(&mut self.tab, Tab::Subtitles, "Subtitles");
-                    if matches!(self.tab, Tab::Favorites | Tab::Subtitles) {
-                        return;
-                    }
-                    ui.separator();
-                    let label = if self.tab == Tab::History {
-                        "Clear history"
-                    } else {
-                        "Clear playlist"
-                    };
-                    if action_icon(
-                        ui,
-                        Icon::Trash,
-                        label,
-                        self.tab == prior && !self.entries.is_empty(),
-                    )
-                    .clicked()
-                    {
-                        let result = if self.tab == Tab::History {
-                            self.db.clear_history()
-                        } else {
-                            self.db.clear_playlist(self.selected)
-                        };
-                        if result.is_ok() {
-                            self.entries.clear();
-                            self.rows.cancel();
-                            if self.tab == Tab::History {
-                                action = Some(Action::ForgetAll);
-                            }
-                        }
-                        self.record(result);
-                    }
                 });
                 if self.tab != prior {
                     self.renaming = false;
@@ -344,6 +317,20 @@ impl Sidebar {
 
     fn apply(&mut self, edit: Edit, list: List, ctx: &egui::Context) -> Option<Action> {
         let result = match edit {
+            Edit::Clear => {
+                let result = match list {
+                    List::History => self.db.clear_history(),
+                    List::Playlist(id) => self.db.clear_playlist(id),
+                    List::Favorites => return None,
+                };
+                let cleared = result.is_ok();
+                if cleared {
+                    self.entries.clear();
+                    self.rows.cancel();
+                }
+                self.record(result);
+                return (cleared && list == List::History).then_some(Action::ForgetAll);
+            }
             Edit::Time(action) => return Some(Action::Time(action)),
             Edit::Open(id, path) => {
                 let queue = match list {

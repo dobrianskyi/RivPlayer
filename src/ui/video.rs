@@ -6,7 +6,7 @@ use eframe::{
     glow::{self, HasContext},
 };
 use oxideav_core::{ColorRange, PixelFormat};
-use rvideoplayer::engine::Picture;
+use rivplayer::engine::Picture;
 
 const VERTEX: &str = r#"
 out vec2 uv;
@@ -57,14 +57,25 @@ void main() {
         return;
     }
 
-    vec2 second = texture(plane1, uv).rg;
+    vec4 second = texture(plane1, uv);
     float luma = sample_value(first.rg, sample_scale.r);
-    float u = sample_value(second, sample_scale.g);
-    float v = sample_value(texture(plane2, uv).rg, sample_scale.b);
+    float u = sample_value(second.rg, sample_scale.g);
+    float v;
 
-    if (layout_mode == 1 || layout_mode == 2) {
-        u = layout_mode == 1 ? second.r : second.g;
-        v = layout_mode == 1 ? second.g : second.r;
+    if (layout_mode == 1 || layout_mode == 2 || layout_mode == 8) {
+        u = layout_mode == 2 ? second.g : second.r;
+        v = layout_mode == 2 ? second.r : second.g;
+        if (layout_mode == 8) {
+            // Normalize the full 16-bit texture range to the P010 code range.
+            const float p010_gain = 65535.0 / 65472.0;
+            luma *= p010_gain;
+            u *= p010_gain;
+            v *= p010_gain;
+        }
+    } else if (layout_mode == 7) {
+        v = sample_value(second.ba, sample_scale.g);
+    } else {
+        v = sample_value(texture(plane2, uv).rg, sample_scale.b);
     }
 
     vec3 rgb;
@@ -94,7 +105,8 @@ pub struct Renderer {
     program: glow::Program,
     vao: glow::VertexArray,
     textures: [glow::Texture; 3],
-    geometry: [(u32, u32, usize); 3],
+    geometry: [(u32, u32, u32); 3],
+    normalized_16: bool,
     uniforms: Uniforms,
     uploaded: Option<u64>,
     scratch: Vec<u8>,
@@ -194,6 +206,9 @@ impl Renderer {
                 program,
                 vao,
                 textures,
+                normalized_16: cfg!(target_endian = "little")
+                    && (!gl.version().is_embedded
+                        || gl.supported_extensions().contains("GL_EXT_texture_norm16")),
                 uniforms,
                 geometry: [(0, 0, 0); 3],
                 uploaded: None,
@@ -228,7 +243,10 @@ impl Renderer {
     fn upload(&mut self, gl: &glow::Context, picture: &Picture) -> Result<()> {
         use PixelFormat::*;
         let format = picture.format;
+        let native_p010 = picture.p010 && self.normalized_16;
         let layout = match format {
+            Nv12 if native_p010 => 8,
+            Nv12 if picture.p010 => 7,
             Nv12 => 1,
             Nv21 => 2,
             Gbrp8 | Gbrp10Le | Gbrp12Le | Gbrp14Le | Gbrp16Le => 3,
@@ -241,6 +259,7 @@ impl Renderer {
             _ => bail!("Unsupported display pixel format {format:?}"),
         };
         let bits = match format {
+            Nv12 if picture.p010 => 10,
             Yuv420P10Le | Yuv422P10Le | Yuv444P10Le | Gbrp10Le | Gray10Le => 10,
             Yuv420P12Le | Yuv422P12Le | Yuv444P12Le | Gbrp12Le | Gray12Le => 12,
             Gbrp14Le => 14,
@@ -249,7 +268,7 @@ impl Renderer {
         };
         let planes = picture.frame.image_planes();
         let used = match layout {
-            1 | 2 => 2,
+            1 | 2 | 7 | 8 => 2,
             4..=6 => 1,
             _ => 3,
         };
@@ -260,6 +279,7 @@ impl Renderer {
                 .plane_dimensions(i, picture.width, picture.height)
                 .context("Invalid plane dimensions")?;
             let bpp = match format {
+                Nv12 if picture.p010 => 2 * (i + 1),
                 Rgb24 | Bgr24 => 3,
                 Rgba | Bgra => 4,
                 Nv12 | Nv21 if i == 1 => 2,
@@ -271,8 +291,9 @@ impl Renderer {
                 .plane_significant_bits(i)
                 .unwrap_or(bits)
                 .clamp(8, 16);
-            if bits > 8 {
-                scale[i] = ((1_u32 << depth) - 1) as f32 / 255.0;
+            if bits > 8 && !native_p010 {
+                let shift = if picture.p010 { 6 } else { 0 };
+                scale[i] = (((1_u32 << depth) - 1) << shift) as f32 / 255.0;
             }
             let stride = plane.stride;
             let row = w as usize * bpp;
@@ -298,12 +319,21 @@ impl Renderer {
                 }
                 &self.scratch
             };
-            let (internal, external) = [
-                (glow::R8, glow::RED),
-                (glow::RG8, glow::RG),
-                (glow::RGB8, glow::RGB),
-                (glow::RGBA8, glow::RGBA),
-            ][bpp - 1];
+            let (internal, external, kind) = if native_p010 {
+                let (internal, external) = if i == 0 {
+                    (glow::R16, glow::RED)
+                } else {
+                    (glow::RG16, glow::RG)
+                };
+                (internal, external, glow::UNSIGNED_SHORT)
+            } else {
+                [
+                    (glow::R8, glow::RED, glow::UNSIGNED_BYTE),
+                    (glow::RG8, glow::RG, glow::UNSIGNED_BYTE),
+                    (glow::RGB8, glow::RGB, glow::UNSIGNED_BYTE),
+                    (glow::RGBA8, glow::RGBA, glow::UNSIGNED_BYTE),
+                ][bpp - 1]
+            };
             // SAFETY: dimensions, strides and the backing slice were validated above.
             unsafe {
                 gl.active_texture(glow::TEXTURE0 + i as u32);
@@ -318,7 +348,7 @@ impl Renderer {
                     },
                 );
                 let pixels = glow::PixelUnpackData::Slice(Some(texels));
-                if self.geometry[i] == (w, h, bpp) {
+                if self.geometry[i] == (w, h, internal) {
                     gl.tex_sub_image_2d(
                         glow::TEXTURE_2D,
                         0,
@@ -327,7 +357,7 @@ impl Renderer {
                         w as i32,
                         h as i32,
                         external,
-                        glow::UNSIGNED_BYTE,
+                        kind,
                         pixels,
                     );
                 } else {
@@ -339,10 +369,10 @@ impl Renderer {
                         h as i32,
                         0,
                         external,
-                        glow::UNSIGNED_BYTE,
+                        kind,
                         pixels,
                     );
-                    self.geometry[i] = (w, h, bpp);
+                    self.geometry[i] = (w, h, internal);
                 }
                 gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
                 gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);

@@ -29,4 +29,4 @@ for name in vobsub.idx vobsub.sub; do
     curl -fsSL --retry 2 --max-time 30 "$vobsub/$name" -o "$work/$name"
 done
 
-RVIDEOPLAYER_CODEC_FIXTURES="$work" cargo test --locked --release --test codecs -- --ignored
+RIVPLAYER_CODEC_FIXTURES="$work" cargo test --locked --release --test codecs -- --ignored

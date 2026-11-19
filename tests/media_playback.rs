@@ -12,7 +12,7 @@ use std::{
 use anyhow::{Result, ensure};
 use oxideav_core::{Demuxer, Error, MediaType, Packet};
 use oxideav_mp4::{BrandPreset, Mp4MuxerOptions};
-use rvideoplayer::{
+use rivplayer::{
     engine::{self, DecodeMode, Event, Options, Player},
     source::{LocalFile, MediaSource, runtime},
 };
@@ -20,7 +20,7 @@ use rvideoplayer::{
 #[test]
 #[ignore = "use scripts/check-containers.sh to supply the media fixtures"]
 fn container_and_transport_regressions() -> Result<()> {
-    let directory = PathBuf::from(std::env::var_os("RVIDEOPLAYER_FIXTURES").unwrap());
+    let directory = PathBuf::from(std::env::var_os("RIVPLAYER_FIXTURES").unwrap());
     let base = directory.join("bear.mp4");
     let vfr = directory.join("bear-vfr.m4v");
     let flv = directory.join("bear-avc.flv");

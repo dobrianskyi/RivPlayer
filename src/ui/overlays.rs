@@ -59,8 +59,13 @@ impl Drag {
         let mut rect = custom.map_or(default, |pos| {
             fit(area.min + area.size() * vec2(pos.x, pos.y))
         });
-        let response = ui.interact(rect, ui.scope_id().with(id), Sense::drag());
-        if response.drag_started_by(PointerButton::Primary) {
+        let response = ui.interact(rect, ui.scope_id().with(id), Sense::click_and_drag());
+        if response.double_clicked_by(PointerButton::Primary) {
+            self.dirty |= custom.take().is_some();
+            self.offset = None;
+            rect = default;
+            ui.ctx().request_repaint();
+        } else if response.drag_started_by(PointerButton::Primary) {
             self.offset = ui.input(|i| i.pointer.press_origin().map(|p| rect.center() - p));
         }
         if let Some(offset) = self.offset
@@ -185,7 +190,7 @@ impl Clock {
             painter.layout_no_wrap(self.text.clone(), FontId::monospace(size), Color32::WHITE);
         let size = label.size() + vec2(18.0, 8.0);
         let default = Rect::from_min_size(
-            pos2(video.right() - size.x - 14.0, video.top() + 53.0),
+            pos2(video.right() - size.x - 26.0, video.top() + 53.0),
             size,
         );
         let rect = drag.place(ui, "clock-overlay", default, drag_area(video), position);

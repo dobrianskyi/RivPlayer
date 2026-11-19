@@ -5,6 +5,7 @@ mod layout;
 mod learning;
 mod library;
 mod library_rows;
+mod mpris;
 mod overlays;
 mod preferences;
 mod preview;
@@ -26,7 +27,7 @@ use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Key, Pos2,
     Rect, RichText, Sense, Vec2, pos2, vec2,
 };
-use rvideoplayer::{
+use rivplayer::{
     engine::{
         BitmapFrame, Captions, MAX_VOLUME, Options, Picture, Player, Repeat, Track, active_cue,
     },
@@ -42,6 +43,7 @@ use controls::{
 };
 use layout::Layout;
 use learning::{Command as Learn, Learning};
+use library::Library;
 use overlays::{Clock, Drag as OverlayDrag, TimeAction};
 use preferences::{ClickAction, MouseSettings, PlaybackSettings, SubtitleChoice};
 
@@ -49,23 +51,24 @@ const SEEK_OFFSET: f32 = 59.0;
 const VOLUME_STEP: f32 = 5.0;
 const WHEEL_SETTLE: Duration = Duration::from_millis(45);
 const WHEEL_MAX_WAIT: Duration = Duration::from_millis(140);
+const LIBRARY_RETRY: Duration = Duration::from_millis(160);
 
 pub fn launch(path: Option<PathBuf>, options: Options, position_explicit: bool) -> Result<()> {
     let icon = Arc::new(
-        eframe::icon_data::from_png_bytes(include_bytes!("../../assets/rvideoplayer.png"))
-            .context("Loading the RVideoPlayer icon")?,
+        eframe::icon_data::from_png_bytes(include_bytes!("../../assets/rivplayer.png"))
+            .context("Loading the RivPlayer icon")?,
     );
     let mut native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("RVideoPlayer")
-            .with_app_id("rvideoplayer")
+            .with_title("RivPlayer")
+            .with_app_id("rivplayer")
             .with_icon(icon.clone())
             .with_inner_size(layout::INITIAL_SIZE)
             .with_min_inner_size(layout::MIN_VIDEO),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
-    match std::env::var("RVIDEOPLAYER_WAYLAND").as_deref() {
+    match std::env::var("RIVPLAYER_WAYLAND").as_deref() {
         Ok("0") => {
             use winit::platform::x11::EventLoopBuilderExtX11;
             native.event_loop_builder = Some(Box::new(|builder| {
@@ -81,7 +84,7 @@ pub fn launch(path: Option<PathBuf>, options: Options, position_explicit: bool) 
         _ => {}
     }
     eframe::run_native(
-        "RVideoPlayer",
+        "RivPlayer",
         native,
         Box::new(move |cc| {
             Ok(Box::new(App::new(
@@ -93,7 +96,7 @@ pub fn launch(path: Option<PathBuf>, options: Options, position_explicit: bool) 
             )?))
         }),
     )
-    .map_err(|err| anyhow!("Opening RVideoPlayer: {err}"))
+    .map_err(|err| anyhow!("Opening RivPlayer: {err}"))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -115,6 +118,11 @@ enum RowAction {
     Alarm,
     Video(u32),
     Audio(u32),
+    ActiveExternalAudio,
+    OpenAudio,
+    RemoveExternalAudio,
+    ToggleSubtitles,
+    ToggleCaptionVisibility,
     Captions(Captions),
     OpenCaptions,
     ToggleSubtitlesPanel,
@@ -161,7 +169,20 @@ impl Row {
 enum Picker {
     Media,
     Captions,
+    Audio,
     Playlist,
+}
+
+struct PendingPicker {
+    kind: Picker,
+    result: Receiver<Vec<PathBuf>>,
+    media_generation: Option<u64>,
+}
+
+struct LibraryStartup {
+    path: Option<PathBuf>,
+    position: Option<f64>,
+    retry_at: Instant,
 }
 
 struct BitmapOverlay {
@@ -177,11 +198,15 @@ struct WheelSeek {
 
 struct App {
     player: Player,
+    media_controls: mpris::MediaControls,
+    mpris_seeked: bool,
+    stopped: bool,
     learning: Learning,
     playback: PlaybackSettings,
     saved_playback: PlaybackSettings,
     selected_caption: Captions,
     requested_caption: Option<PathBuf>,
+    requested_audio: Option<PathBuf>,
     renderer: Arc<Mutex<video::Renderer>>,
     picture: Option<Arc<Picture>>,
     bitmap_captions: Option<BitmapOverlay>,
@@ -198,11 +223,13 @@ struct App {
     drag: Option<f64>,
     wheel_seek: Option<WheelSeek>,
     volume_open: bool,
-    dialog: Option<(Picker, Receiver<Vec<PathBuf>>)>,
+    dialog: Option<PendingPicker>,
+    media_generation: u64,
     video_dialog: Option<dialogs::Dialog>,
     mouse: MouseSettings,
     last_video_click: Option<ClickAction>,
     sidebar: Sidebar,
+    library_startup: Option<LibraryStartup>,
     layout: Layout,
     playback_cue: Option<PlaybackCue>,
     preview: Preview,
@@ -246,7 +273,7 @@ impl App {
         visuals.window_stroke = egui::Stroke::new(1.0, PANEL_BORDER);
         cc.egui_ctx.set_visuals(visuals);
         let title_icon = cc.egui_ctx.load_texture(
-            "rvideoplayer-icon",
+            "rivplayer-icon",
             egui::ColorImage::from_rgba_unmultiplied(
                 [icon.width as usize, icon.height as usize],
                 &icon.rgba,
@@ -254,20 +281,31 @@ impl App {
             egui::TextureOptions::LINEAR,
         );
         let ctx = cc.egui_ctx.clone();
-        let sidebar = Sidebar::new(cc.egui_ctx.clone())?;
-        let mouse = sidebar.db.mouse_settings()?;
-        let playback = sidebar.db.playback_settings()?;
+        let (sidebar, mouse, playback, waiting) = match Self::load_library(&ctx) {
+            Ok((sidebar, mouse, playback)) => (sidebar, mouse, playback, false),
+            Err(err) if Library::is_busy(&err) => (
+                Sidebar::new(ctx.clone(), Library::temporary()?, None)?,
+                MouseSettings::default(),
+                PlaybackSettings::default(),
+                true,
+            ),
+            Err(err) => return Err(err),
+        };
         let mut player = Player::new(move || ctx.request_repaint(), options.mode);
         player.restore_volume(playback.volume, playback.muted);
         player.set_rate(playback.rate);
         player.set_voice_boost(playback.voice);
         let mut app = Self {
             player,
+            media_controls: mpris::MediaControls::start(cc.egui_ctx.clone()),
+            mpris_seeked: false,
+            stopped: false,
             learning: Learning::default(),
             playback,
             saved_playback: playback,
             selected_caption: Captions::Off,
             requested_caption: None,
+            requested_audio: None,
             renderer,
             picture: None,
             bitmap_captions: None,
@@ -275,7 +313,7 @@ impl App {
             clock_drag: OverlayDrag::default(),
             caption_drag: OverlayDrag::default(),
             serial: 0,
-            title: "RVideoPlayer".into(),
+            title: "RivPlayer".into(),
             title_icon,
             last_input: Instant::now(),
             pointer: None,
@@ -285,10 +323,16 @@ impl App {
             wheel_seek: None,
             volume_open: false,
             dialog: None,
+            media_generation: 0,
             video_dialog: None,
             mouse,
             last_video_click: None,
             sidebar,
+            library_startup: Some(LibraryStartup {
+                path,
+                position: position_explicit.then_some(options.position),
+                retry_at: Instant::now() + LIBRARY_RETRY,
+            }),
             layout: Layout::new(cc.winit_window().map(Arc::as_ref)),
             playback_cue: None,
             preview: Preview::new(cc.egui_ctx.clone()),
@@ -300,24 +344,63 @@ impl App {
             history_cover: false,
             cover_attempt: Instant::now(),
         };
-        if let Some(path) = path {
-            app.open(
-                &cc.egui_ctx,
-                path,
-                position_explicit.then_some(options.position),
-                None,
-                false,
-            );
-        } else {
-            match app.sidebar.db.last_video() {
-                Ok(Some((path, position))) if readable_file(&path) => {
-                    app.open(&cc.egui_ctx, path, Some(position), None, true);
-                }
-                Ok(_) => {}
-                Err(err) => app.sidebar.error = Some(format!("{err:#}")),
-            }
+        if !waiting {
+            app.restore_initial_media(&cc.egui_ctx);
         }
         Ok(app)
+    }
+
+    fn restore_initial_media(&mut self, ctx: &egui::Context) {
+        let Some(startup) = self.library_startup.take() else {
+            return;
+        };
+        if let Some(path) = startup.path {
+            self.open(ctx, path, startup.position, None, false);
+        } else {
+            match self.sidebar.db.last_video() {
+                Ok(Some((path, position))) if readable_file(&path) => {
+                    self.open(ctx, path, Some(position), None, true);
+                }
+                Ok(_) => {}
+                Err(err) => self.sidebar.error = Some(format!("{err:#}")),
+            }
+        }
+    }
+
+    fn load_library(ctx: &egui::Context) -> Result<(Sidebar, MouseSettings, PlaybackSettings)> {
+        let (db, error) = Library::open_for_startup()?;
+        let mouse = db.mouse_settings()?;
+        let playback = db.playback_settings()?;
+        Ok((Sidebar::new(ctx.clone(), db, error)?, mouse, playback))
+    }
+
+    fn poll_library(&mut self, ctx: &egui::Context) -> bool {
+        let Some(startup) = &mut self.library_startup else {
+            return true;
+        };
+        if let Some(wait) = startup.retry_at.checked_duration_since(Instant::now()) {
+            ctx.request_repaint_after(wait);
+            return false;
+        }
+        match Self::load_library(ctx) {
+            Ok((sidebar, mouse, playback)) => {
+                self.sidebar = sidebar;
+                self.mouse = mouse;
+                self.player.restore_volume(playback.volume, playback.muted);
+                self.player.set_rate(playback.rate);
+                self.player.set_voice_boost(playback.voice);
+                self.playback = playback;
+                self.saved_playback = playback;
+            }
+            Err(err) if Library::is_busy(&err) => {
+                startup.retry_at = Instant::now() + LIBRARY_RETRY;
+                ctx.request_repaint_after(LIBRARY_RETRY);
+                return false;
+            }
+            Err(err) => self.sidebar.error = Some(format!("Temporary library · {err:#}")),
+        }
+        self.restore_initial_media(ctx);
+        true
     }
 
     fn open(
@@ -345,6 +428,7 @@ impl App {
         });
         self.preview.invalidate(&path);
         self.path = Some(path.clone());
+        self.media_generation = self.media_generation.wrapping_add(1);
         self.learning =
             Learning::new(self.sidebar.db.media_settings(&path).unwrap_or_else(|err| {
                 self.sidebar.error = Some(format!("{err:#}"));
@@ -352,14 +436,16 @@ impl App {
             }));
         self.selected_caption = Captions::Off;
         self.requested_caption = None;
+        self.requested_audio = None;
         self.queued = queue;
+        self.stopped = false;
         self.history_saved = false;
         self.history_forgotten = false;
         self.history_cover = false;
         self.cover_attempt = Instant::now();
         self.title = library::title(&path);
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
-            "{} — RVideoPlayer",
+            "{} — RivPlayer",
             self.title
         )));
         self.picture = None;
@@ -372,12 +458,13 @@ impl App {
         self.last_video_click = None;
         self.last_input = Instant::now();
         let source = Arc::new(LocalFile(path));
-        self.player.open_with_tracks(
+        self.player.open_with_audio(
             source,
             position,
             !paused,
             self.learning.media.video,
             self.learning.media.audio,
+            self.learning.media.external_audio.clone(),
         );
         if let SubtitleChoice::Sidecar(Some(path)) = &self.learning.media.subtitles
             && readable_file(path)
@@ -426,6 +513,7 @@ impl App {
         {
             self.learning.media.subtitles = SubtitleChoice::Sidecar(self.requested_caption.take());
             self.playback.captions = true;
+            self.playback.show_cc = true;
             self.learning.cue_loop = None;
             self.sync_repeat();
             self.learning.clear_follow();
@@ -457,6 +545,18 @@ impl App {
             && matches!(selected, Captions::Track(_))
         {
             self.player.read_transcript();
+        }
+    }
+
+    fn update_external_audio(&mut self) {
+        let Some(path) = self.requested_audio.as_deref() else {
+            return;
+        };
+        if self.player.active_external_audio_path() == Some(path) {
+            self.learning.media.external_audio = self.requested_audio.take();
+            self.save_media_preferences();
+        } else if self.player.external_audio_path() != Some(path) || self.player.error.is_some() {
+            self.requested_audio = None;
         }
     }
 
@@ -494,6 +594,7 @@ impl App {
             self.sync_repeat();
         }
         self.player.seek(time);
+        self.mpris_seeked = true;
         self.save_history(false);
     }
 
@@ -518,7 +619,10 @@ impl App {
         let position = self.player.position();
         match command {
             Learn::Open => self.picker(ctx, Picker::Captions),
-            Learn::Visible => self.playback.captions = !self.playback.captions,
+            Learn::Visible => {
+                self.playback.captions = !self.playback.captions;
+                self.playback.show_cc |= self.playback.captions;
+            }
             Learn::Track(track) => {
                 self.learning.media.subtitles = match track {
                     Captions::Track(id) => SubtitleChoice::Embedded(id),
@@ -703,13 +807,31 @@ impl App {
         }
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
-        self.dialog = Some((kind, rx));
+        self.dialog = Some(PendingPicker {
+            kind,
+            result: rx,
+            media_generation: matches!(kind, Picker::Audio | Picker::Captions)
+                .then_some(self.media_generation),
+        });
         std::thread::spawn(move || {
             let dialog = rfd::FileDialog::new();
             let files = match kind {
                 Picker::Captions => dialog
                     .set_title("Open subtitles")
                     .add_filter("Subtitles", &["srt", "vtt", "ass", "ssa", "sup", "idx"])
+                    .pick_file()
+                    .into_iter()
+                    .collect(),
+                Picker::Audio => dialog
+                    .set_title("Open external audio")
+                    .add_filter(
+                        "Audio",
+                        &[
+                            "ac3", "eac3", "flac", "m4a", "mka", "mp3", "oga", "ogg", "opus",
+                            "mp4", "mkv", "mov", "webm",
+                        ],
+                    )
+                    .add_filter("All files", &["*"])
                     .pick_file()
                     .into_iter()
                     .collect(),
@@ -741,12 +863,132 @@ impl App {
     fn toggle_playback(&mut self) {
         self.player.play_pause();
         if self.player.is_playing() {
+            self.stopped = false;
             self.clock.elapsed = None;
         }
         self.playback_cue = Some(PlaybackCue::new(self.player.is_playing()));
         if !self.player.is_playing() {
             self.save_history(true);
         }
+    }
+
+    fn playlist_step(&mut self, ctx: &egui::Context, forward: bool, paused: bool) {
+        let Some(queue) = self.queued else {
+            return;
+        };
+        let stopped = self.stopped || self.player.ended();
+        match self.sidebar.adjacent(queue, forward) {
+            Ok(Some((path, item))) => {
+                self.open(ctx, path, None, Some(item), paused);
+                self.stopped = stopped && paused;
+            }
+            Ok(None) => {}
+            Err(err) => self.sidebar.error = Some(format!("{err:#}")),
+        }
+    }
+
+    fn handle_media_controls(&mut self, ctx: &egui::Context) {
+        use mpris::Command;
+        for _ in 0..32 {
+            let Ok(command) = self.media_controls.commands.try_recv() else {
+                break;
+            };
+            let playing = self.player.is_playing();
+            let loaded = self.player.has_source();
+            let playable = loaded && self.player.error.is_none();
+            match command {
+                Command::Raise => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                Command::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Command::Next => self.playlist_step(ctx, true, !playing),
+                Command::Previous => self.playlist_step(ctx, false, !playing),
+                Command::Pause if playing => self.toggle_playback(),
+                Command::Play if loaded && !playing => self.toggle_playback(),
+                Command::PlayPause if loaded => self.toggle_playback(),
+                Command::Stop if loaded && !self.stopped => {
+                    if playing {
+                        self.toggle_playback();
+                    }
+                    self.stopped = true;
+                    self.seek_to(0.0);
+                }
+                Command::Seek(offset) if playable && self.player.info.is_some() => {
+                    let target = (self.player.position() + offset).max(0.0);
+                    if self.player.duration().is_some_and(|end| target > end) {
+                        self.playlist_step(ctx, true, !playing);
+                    } else {
+                        self.seek_to(target);
+                    }
+                }
+                Command::SetPosition(id, time)
+                    if playable
+                        && self.player.info.is_some()
+                        && id.as_str() == mpris::track_id(self.media_generation).as_str()
+                        && time >= 0.0
+                        && self.player.duration().is_none_or(|end| time <= end) =>
+                {
+                    self.seek_to(time);
+                }
+                Command::Open(path) if readable_file(&path) && !is_caption(&path) => {
+                    self.open(ctx, path, None, None, false);
+                }
+                Command::Rate(rate, reply) => {
+                    if self.player.rate() != rate {
+                        self.player.set_rate(rate);
+                    }
+                    self.publish_media_controls();
+                    let _ = reply.try_send(());
+                }
+                Command::Volume(volume, reply) => {
+                    self.player.set_volume(volume as f32);
+                    self.publish_media_controls();
+                    let _ = reply.try_send(());
+                }
+                _ => {}
+            }
+        }
+        if !self.media_controls.commands.is_empty() {
+            ctx.request_repaint();
+        }
+    }
+
+    fn publish_media_controls(&mut self) {
+        let (next, previous) = self
+            .sidebar
+            .queue_availability(self.queued)
+            .unwrap_or_default();
+        let can_play = self.player.has_source() && self.player.error.is_none();
+        let status = if !can_play || self.player.ended() || self.stopped {
+            mpris::Status::Stopped
+        } else if self.player.is_playing() {
+            mpris::Status::Playing
+        } else {
+            mpris::Status::Paused
+        };
+        self.media_controls.update(
+            self.path
+                .as_deref()
+                .map(|path| (self.media_generation, path, self.title.as_str())),
+            self.player.duration(),
+            mpris::Playback {
+                status,
+                position: self.player.position(),
+                advancing: status == mpris::Status::Playing && !self.player.is_loading(),
+                rate: self.player.rate(),
+                volume: if self.player.muted {
+                    0.0
+                } else {
+                    f64::from(self.player.volume)
+                },
+                next,
+                previous,
+                can_seek: can_play && self.player.info.is_some(),
+                can_play,
+            },
+            std::mem::take(&mut self.mpris_seeked),
+        );
     }
 
     fn video_click(&mut self, ctx: &egui::Context, action: ClickAction) {
@@ -1282,7 +1524,9 @@ impl App {
             .or_else(|| {
                 matches!(self.video_dialog, Some(dialogs::Dialog::Alarm)).then(|| "Alarm".into())
             });
-        let time_end = right - step * if alarm.is_some() { 3.0 } else { 2.0 } - 3.0;
+        let caption_slot = if alarm.is_some() { 3.5 } else { 2.5 };
+        let right_buttons = 2 + u8::from(alarm.is_some()) + u8::from(self.playback.show_cc);
+        let time_end = right - step * f32::from(right_buttons) - 3.0;
         if time_x < time_end {
             let current = timestamp(self.drag.unwrap_or(display_position));
             let full = duration.map_or_else(
@@ -1299,6 +1543,16 @@ impl App {
             }
         }
 
+        if self.playback.show_cc {
+            let captions = btn(right - step * caption_slot);
+            if button(ui, captions, "Subtitles (CC)", Icon::Captions).clicked() {
+                self.menu = (self.menu != Some(Menu::Subtitles)).then_some(Menu::Subtitles);
+            }
+            if self.player.captions != Captions::Off {
+                let center = captions.center() + vec2(0.0, 12.0);
+                p.rect_filled(Rect::from_center_size(center, vec2(22.0, 2.0)), 1.0, RED);
+            }
+        }
         if let Some(label) = alarm {
             let alarm = btn(right - step * 2.5);
             if named_button(ui, alarm, "alarm", &label, Icon::Alarm).clicked() {
@@ -1307,11 +1561,10 @@ impl App {
         }
         let settings = btn(right - step * 1.5);
         if button(ui, settings, "Settings", Icon::Settings).clicked() {
-            self.menu = if self.menu.is_some() {
-                None
-            } else {
-                Some(Menu::Settings)
-            };
+            self.menu = self
+                .menu
+                .is_none_or(|menu| menu == Menu::Subtitles)
+                .then_some(Menu::Settings);
         }
         let full = if self.fullscreen {
             ("Exit full screen (f)", Icon::ExitFullscreen)
@@ -1327,11 +1580,16 @@ impl App {
                 .info
                 .as_ref()
                 .and_then(|info| info.current_video);
-            let image = self
-                .path
-                .as_ref()
-                .filter(|_| key.is_some() && !self.player.is_loading() && self.wheel_seek.is_none())
-                .and_then(|file| self.preview.get(ui.ctx(), file, key, time));
+            let tolerance = (duration * 20.0 / f64::from(track.width())).clamp(0.35, 8.0);
+            let image =
+                if let Some(file) = self.path.as_ref().filter(|_| {
+                    key.is_some() && !self.player.is_loading() && self.wheel_seek.is_none()
+                }) {
+                    self.preview.get(ui.ctx(), file, key, time, tolerance)
+                } else {
+                    self.preview.cancel();
+                    None
+                };
             let height = if image.is_some() { 121.0_f32 } else { 26.0 }
                 .min(rect.height() - SEEK_OFFSET - 12.0);
             let width = if image.is_some() { 186.0 } else { 72.0 };
@@ -1394,19 +1652,15 @@ impl App {
                 format!("{speed}×")
             }
         };
-        let caption_value = match self.player.captions {
-            Captions::Off => "Off".to_owned(),
-            Captions::Sidecar => "Subtitle file".to_owned(),
-            Captions::Track(index) => text_tracks
-                .iter()
-                .find(|t| t.index == index)
-                .map_or("On".into(), caption_label),
-        };
         let (title, rows) = match menu {
             Menu::Settings => {
                 let mut rows = vec![
                     Row::page("Playback speed", normal(self.player.rate()), Menu::Speed),
-                    Row::page("Subtitles", caption_value, Menu::Subtitles),
+                    Row::toggle(
+                        "Subtitles",
+                        self.playback.show_cc,
+                        RowAction::ToggleSubtitles,
+                    ),
                     Row::toggle("A–B", self.playback.show_ab, RowAction::ToggleAb),
                     Row::toggle("Time", self.playback.show_clock, RowAction::ToggleClock),
                     Row::choice("Alarm".into(), false, RowAction::Alarm),
@@ -1418,27 +1672,19 @@ impl App {
                         .map_or(String::new(), video_label);
                     rows.push(Row::page("Video track", current, Menu::Video));
                 }
-                if audio_tracks.len() > 1 {
-                    let current = audio_tracks
+                let current = if let Some(path) = self.player.active_external_audio_path() {
+                    library::title(path)
+                } else {
+                    audio_tracks
                         .iter()
                         .find(|t| Some(t.index) == current_audio)
-                        .map_or(String::new(), audio_label);
-                    rows.push(Row::page("Audio track", current, Menu::Audio));
-                }
-                rows.push(Row::toggle(
-                    "Voice Boost",
-                    self.player.voice_boost(),
-                    RowAction::VoiceBoost,
-                ));
+                        .map_or(String::new(), audio_label)
+                };
+                rows.push(Row::page("Audio", current, Menu::Audio));
                 rows.push(Row::choice(
-                    "Player settings".into(),
+                    "Settings".into(),
                     false,
                     RowAction::Settings(dialogs::SettingsTab::Controls),
-                ));
-                rows.push(Row::choice(
-                    "About".into(),
-                    false,
-                    RowAction::Settings(dialogs::SettingsTab::About),
                 ));
                 ("", rows)
             }
@@ -1468,19 +1714,45 @@ impl App {
                     })
                     .collect(),
             ),
-            Menu::Audio => (
-                "Audio track",
-                audio_tracks
+            Menu::Audio => {
+                let external = self.player.active_external_audio_path();
+                let mut rows: Vec<_> = audio_tracks
                     .iter()
                     .map(|t| {
                         Row::choice(
                             audio_label(t),
-                            Some(t.index) == current_audio,
+                            external.is_none() && Some(t.index) == current_audio,
                             RowAction::Audio(t.index),
                         )
                     })
-                    .collect(),
-            ),
+                    .collect();
+                if let Some(path) = external {
+                    rows.insert(
+                        0,
+                        Row::choice(library::title(path), true, RowAction::ActiveExternalAudio),
+                    );
+                }
+                rows.push(Row::choice(
+                    "Open external audio…".into(),
+                    false,
+                    RowAction::OpenAudio,
+                ));
+                if self.player.external_audio_path().is_some()
+                    || self.learning.media.external_audio.is_some()
+                {
+                    rows.push(Row::choice(
+                        "Use original audio".into(),
+                        false,
+                        RowAction::RemoveExternalAudio,
+                    ));
+                }
+                rows.push(Row::toggle(
+                    "Voice Boost",
+                    self.player.voice_boost(),
+                    RowAction::VoiceBoost,
+                ));
+                ("Audio", rows)
+            }
             Menu::Subtitles => {
                 let panel_label = if self.sidebar.subtitles_open() {
                     "Hide subtitle panel"
@@ -1489,24 +1761,24 @@ impl App {
                 };
                 let mut rows = vec![
                     Row::choice(panel_label.into(), false, RowAction::ToggleSubtitlesPanel),
-                    Row::choice(
-                        "Hide subtitles on video".into(),
-                        self.player.captions == Captions::Off,
-                        RowAction::Captions(Captions::Off),
+                    Row::toggle(
+                        "Show on video",
+                        self.playback.captions,
+                        RowAction::ToggleCaptionVisibility,
                     ),
                 ];
                 for track in text_tracks {
                     let mode = Captions::Track(track.index);
                     rows.push(Row::choice(
                         caption_label(track),
-                        self.player.captions == mode,
+                        self.selected_caption == mode,
                         RowAction::Captions(mode),
                     ));
                 }
                 if self.player.has_sidecar() {
                     rows.push(Row::choice(
                         "Subtitle file".into(),
-                        self.player.captions == Captions::Sidecar,
+                        self.selected_caption == Captions::Sidecar,
                         RowAction::Captions(Captions::Sidecar),
                     ));
                 }
@@ -1514,6 +1786,11 @@ impl App {
                     "Open subtitle file…".into(),
                     false,
                     RowAction::OpenCaptions,
+                ));
+                rows.push(Row::choice(
+                    "Turn subtitles off".into(),
+                    false,
+                    RowAction::ToggleSubtitles,
                 ));
                 ("Subtitles", rows)
             }
@@ -1538,22 +1815,29 @@ impl App {
                 p.rect_filled(rect, CornerRadius::same(12), PANEL_BACKGROUND);
                 if !title.is_empty() {
                     let label = Rect::from_min_size(rect.min, vec2(width, top));
-                    let resp = ui
-                        .interact(label, ui.scope_id().with("back"), Sense::click())
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
                     let p = ui.painter();
-                    let x = label.left() + 20.0;
                     let y = label.center().y;
-                    p.line_segment(
-                        [pos2(x + 2.0, y - 5.0), pos2(x - 3.0, y)],
-                        egui::Stroke::new(1.5, WHITE),
-                    );
-                    p.line_segment(
-                        [pos2(x - 3.0, y), pos2(x + 2.0, y + 5.0)],
-                        egui::Stroke::new(1.5, WHITE),
-                    );
+                    let mut title_x = label.left() + 14.0;
+                    if menu != Menu::Subtitles {
+                        let resp = ui
+                            .interact(label, ui.scope_id().with("back"), Sense::click())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        let x = label.left() + 20.0;
+                        p.line_segment(
+                            [pos2(x + 2.0, y - 5.0), pos2(x - 3.0, y)],
+                            egui::Stroke::new(1.5, WHITE),
+                        );
+                        p.line_segment(
+                            [pos2(x - 3.0, y), pos2(x + 2.0, y + 5.0)],
+                            egui::Stroke::new(1.5, WHITE),
+                        );
+                        title_x = x + 19.0;
+                        if resp.clicked() {
+                            action = Some(RowAction::Menu(Menu::Settings));
+                        }
+                    }
                     p.text(
-                        pos2(x + 19.0, y),
+                        pos2(title_x, y),
                         Align2::LEFT_CENTER,
                         title,
                         FontId::proportional(14.5),
@@ -1564,9 +1848,6 @@ impl App {
                         label.bottom(),
                         egui::Stroke::new(1.0, Color32::from_white_alpha(28)),
                     );
-                    if resp.clicked() {
-                        action = Some(RowAction::Menu(Menu::Settings));
-                    }
                 }
                 let list_rect =
                     Rect::from_min_max(rect.min + vec2(0.0, top + 6.0), rect.max - vec2(0.0, 6.0));
@@ -1576,11 +1857,22 @@ impl App {
                         .max_height(list_rect.height())
                         .show(ui, |ui| {
                             for row in rows {
+                                let interactive =
+                                    !matches!(row.action, RowAction::ActiveExternalAudio);
+                                let sense = if interactive {
+                                    Sense::click()
+                                } else {
+                                    Sense::hover()
+                                };
                                 let (r, resp) =
-                                    ui.allocate_exact_size(vec2(width, row_height), Sense::click());
-                                let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                                    ui.allocate_exact_size(vec2(width, row_height), sense);
+                                let resp = if interactive {
+                                    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+                                } else {
+                                    resp
+                                };
                                 let p = ui.painter();
-                                if resp.hovered() {
+                                if interactive && resp.hovered() {
                                     p.rect_filled(r, 0.0, Color32::from_white_alpha(27));
                                 }
                                 let y = r.center().y;
@@ -1607,20 +1899,42 @@ impl App {
                                         egui::Stroke::new(1.6, WHITE),
                                     );
                                 }
-                                p.text(
-                                    pos2(x, y),
-                                    Align2::LEFT_CENTER,
+                                let mut label = egui::text::LayoutJob::simple_singleline(
                                     row.label,
                                     FontId::proportional(14.0),
                                     WHITE,
                                 );
-                                p.text(
-                                    pos2(r.right() - 30.0, y),
-                                    Align2::RIGHT_CENTER,
+                                let mut value = egui::text::LayoutJob::simple_singleline(
                                     row.value,
                                     FontId::proportional(13.0),
                                     Color32::from_gray(205),
                                 );
+                                let right = r.right()
+                                    - if submenu || subtitle_panel {
+                                        30.0
+                                    } else {
+                                        14.0
+                                    };
+                                label.wrap.max_width = (right - x).max(1.0);
+                                label.wrap.max_rows = 1;
+                                value.wrap.max_rows = 1;
+                                let label = p.layout_job(label);
+                                value.wrap.max_width = (right - x - label.size().x - 12.0).max(1.0);
+                                let value = p.layout_job(value);
+                                p.galley(pos2(x, y - label.size().y / 2.0), label.clone(), WHITE);
+                                p.galley(
+                                    pos2(right - value.size().x, y - value.size().y / 2.0),
+                                    value.clone(),
+                                    WHITE,
+                                );
+                                let clicked = resp.clicked();
+                                if label.elided || value.elided {
+                                    resp.on_hover_text(if label.elided {
+                                        label.text()
+                                    } else {
+                                        value.text()
+                                    });
+                                }
                                 if submenu {
                                     draw(p, pos2(r.right() - 16.0, y), Icon::Arrow, WHITE);
                                 } else if subtitle_panel {
@@ -1631,7 +1945,7 @@ impl App {
                                     };
                                     draw(p, pos2(r.right() - 16.0, y), icon, WHITE);
                                 }
-                                if resp.clicked() {
+                                if clicked {
                                     action = Some(row.action);
                                 }
                             }
@@ -1662,16 +1976,28 @@ impl App {
                     }
                 }
                 RowAction::Audio(id) => {
+                    self.requested_audio = None;
                     self.learning.media.audio = Some(id);
+                    self.learning.media.external_audio = None;
                     self.save_media_preferences();
-                    if Some(id) != current_audio {
+                    if Some(id) != current_audio || self.player.external_audio_path().is_some() {
                         self.player.select_audio(id);
                     }
                 }
-                RowAction::Captions(Captions::Off) => {
-                    self.playback.captions = false;
-                    self.update_captions();
+                RowAction::OpenAudio => self.picker(ctx, Picker::Audio),
+                RowAction::RemoveExternalAudio => {
+                    self.requested_audio = None;
+                    self.learning.media.external_audio = None;
+                    self.player.select_external_audio(None);
+                    self.save_media_preferences();
                 }
+                RowAction::ToggleSubtitles => {
+                    self.playback.show_cc = !self.playback.show_cc;
+                    self.playback.captions = self.playback.show_cc;
+                    self.update_captions();
+                    self.save_playback_preferences();
+                }
+                RowAction::ToggleCaptionVisibility => self.learning_action(ctx, Learn::Visible),
                 RowAction::Captions(caption) => {
                     self.playback.captions = true;
                     self.learning_action(ctx, Learn::Track(caption));
@@ -1747,12 +2073,31 @@ fn readable_file(path: &Path) -> bool {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Some((kind, dialog)) = &self.dialog {
-            match dialog.try_recv() {
+        if !self.poll_library(ctx) {
+            return;
+        }
+        if let Some(dialog) = &self.dialog {
+            match dialog.result.try_recv() {
                 Ok(files) => {
-                    let kind = *kind;
+                    let kind = dialog.kind;
+                    let stale = dialog
+                        .media_generation
+                        .is_some_and(|generation| generation != self.media_generation);
                     self.dialog = None;
-                    self.load_files(ctx, files, matches!(kind, Picker::Playlist));
+                    if stale {
+                        if !files.is_empty() {
+                            self.player.notice =
+                                Some("The video changed before a file was selected".into());
+                        }
+                    } else if matches!(kind, Picker::Audio) {
+                        if let Some(path) = files.into_iter().next() {
+                            let path = path.canonicalize().unwrap_or(path);
+                            self.requested_audio = Some(path.clone());
+                            self.player.select_external_audio(Some(path));
+                        }
+                    } else {
+                        self.load_files(ctx, files, matches!(kind, Picker::Playlist));
+                    }
                 }
                 Err(mpsc::TryRecvError::Disconnected) => self.dialog = None,
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -1774,6 +2119,7 @@ impl eframe::App for App {
             self.load_files(ctx, dropped, append_only);
         }
         let was_playing = self.player.is_playing();
+        self.handle_media_controls(ctx);
         self.keyboard(ctx);
         if let Some(seek) = &self.wheel_seek {
             if let Some(wait) = seek.due.checked_duration_since(Instant::now()) {
@@ -1786,6 +2132,7 @@ impl eframe::App for App {
             self.picture = Some(Arc::new(picture.picture));
             self.serial = self.serial.wrapping_add(1);
         }
+        self.update_external_audio();
         if self
             .clock
             .tick(ctx, self.playback.show_clock && self.player.has_source())
@@ -1807,23 +2154,35 @@ impl eframe::App for App {
         {
             self.save_history(true);
         }
-        if self.player.ended()
+        if was_playing
+            && self.player.ended()
             && self.wheel_seek.is_none()
             && self.clock.elapsed.is_none()
-            && let Some(queue) = self.queued.take()
         {
-            match self.sidebar.next(queue) {
-                Ok(Some((path, item))) => self.open(ctx, path, None, Some(item), false),
-                Ok(None) => {}
-                Err(err) => self.sidebar.error = Some(format!("{err:#}")),
-            }
+            self.playlist_step(ctx, true, false);
         }
+        self.publish_media_controls();
         if let Some(delay) = self.player.repaint_after() {
             ctx.request_repaint_after(delay);
         }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        if self.library_startup.is_some() {
+            let center = ui.max_rect().center();
+            ui.put(
+                Rect::from_center_size(center - vec2(0.0, 13.0), vec2(22.0, 22.0)),
+                egui::Spinner::new().size(22.0),
+            );
+            ui.painter().text(
+                center + vec2(0.0, 19.0),
+                Align2::CENTER_CENTER,
+                "Waiting for the media library…",
+                FontId::proportional(14.0),
+                WHITE,
+            );
+            return;
+        }
         let ctx = ui.ctx().clone();
         let workspace = ui.max_rect();
         let aspect = self.picture_aspect();

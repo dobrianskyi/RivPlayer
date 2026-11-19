@@ -19,6 +19,7 @@ pub enum Icon {
     Sound,
     Quiet,
     Mute,
+    Captions,
     Alarm,
     Settings,
     Fullscreen,
@@ -27,9 +28,7 @@ pub enum Icon {
     Arrow,
     PanelOpen,
     PanelClose,
-    Trash,
     Grip,
-    Star,
     Remove,
 }
 
@@ -118,6 +117,24 @@ pub(super) fn draw_scaled(p: &Painter, center: Pos2, icon: Icon, color: Color32,
                 }
             }
         }
+        Captions => {
+            p.rect_filled(rect(-10.5, -7.5, 10.5, 7.5), 2.0, color);
+            for x in [-7.0, 0.7] {
+                p.add(Shape::line(
+                    points(&[
+                        (x + 5.3, -2.4),
+                        (x + 4.0, -3.4),
+                        (x + 1.4, -3.4),
+                        (x, -2.2),
+                        (x, 2.0),
+                        (x + 1.4, 3.2),
+                        (x + 4.0, 3.2),
+                        (x + 5.3, 2.2),
+                    ]),
+                    Stroke::new(1.45 * scale, PANEL_BACKGROUND),
+                ));
+            }
+        }
         Alarm => {
             p.circle_stroke(at(0.0, 0.5), 7.6 * scale, Stroke::new(1.7 * scale, color));
             line(&[(0.0, -4.0), (0.0, 0.5), (3.2, 2.5)], 1.6);
@@ -175,34 +192,12 @@ pub(super) fn draw_scaled(p: &Painter, center: Pos2, icon: Icon, color: Color32,
         PanelOpen => line(&[(-2.5, -6.0), (3.5, 0.0), (-2.5, 6.0)], 1.8),
         PanelClose => line(&[(2.5, -6.0), (-3.5, 0.0), (2.5, 6.0)], 1.8),
         Arrow => line(&[(-2.3, -4.5), (2.2, 0.0), (-2.3, 4.5)], 1.5),
-        Trash => {
-            line(&[(-8.0, -5.0), (8.0, -5.0)], 1.45);
-            line(
-                &[(-3.0, -5.0), (-3.0, -8.0), (3.0, -8.0), (3.0, -5.0)],
-                1.45,
-            );
-            line(&[(-6.0, -4.0), (-5.0, 7.0), (5.0, 7.0), (6.0, -4.0)], 1.45);
-            for x in [-2.0, 2.0] {
-                line(&[(x, -2.0), (x, 4.4)], 1.25);
-            }
-        }
         Grip => {
             for x in [-2.5, 2.5] {
                 for y in [-5.5, 0.0, 5.5] {
                     p.circle_filled(at(x, y), 1.15 * scale, color);
                 }
             }
-        }
-        Star => {
-            let points: Vec<_> = (0..=10)
-                .map(|i| {
-                    let angle =
-                        i as f32 * std::f32::consts::TAU / 10.0 - std::f32::consts::FRAC_PI_2;
-                    let radius = if i % 2 == 0 { 9.5 } else { 4.3 };
-                    (radius * angle.cos(), radius * angle.sin())
-                })
-                .collect();
-            line(&points, 1.65);
         }
         Remove => {
             line(&[(-3.7, -3.7), (3.7, 3.7)], 1.65);

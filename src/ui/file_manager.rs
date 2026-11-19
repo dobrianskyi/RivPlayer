@@ -14,7 +14,7 @@ const URI_PATH: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'.')
     .remove(b'~');
 
-fn file_uri(path: &Path) -> String {
+pub fn file_uri(path: &Path) -> String {
     format!(
         "file://{}",
         percent_encode(path.as_os_str().as_bytes(), URI_PATH)

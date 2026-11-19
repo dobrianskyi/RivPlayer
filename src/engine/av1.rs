@@ -196,6 +196,7 @@ impl RawPicture {
             width,
             height,
             format,
+            p010: false,
             color,
             frame: VideoFrame {
                 pts: timestamp,

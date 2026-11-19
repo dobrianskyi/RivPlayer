@@ -18,12 +18,13 @@ legacy=https://android.googlesource.com/platform/external/chromium_org/+/21a33e9
 curl -fsSL --retry 2 --max-time 30 "$legacy/bear_mpeg4_mp3.avi?format=TEXT" \
     | base64 -d > "$work/bear_mpeg4_mp3.avi"
 
-RVIDEOPLAYER_FIXTURES="$work" cargo test --locked --release --test media_playback -- --ignored
+RIVPLAYER_FIXTURES="$work" cargo test --locked --release --test media_playback -- --ignored
+RIVPLAYER_FIXTURES="$work" cargo test --locked --release --lib external_audio_ -- --ignored
 printf 'pcm.!default { type null }\n' > "$work/alsa-null.conf"
-ALSA_CONFIG_PATH="$work/alsa-null.conf" RVIDEOPLAYER_FIXTURES="$work" \
+ALSA_CONFIG_PATH="$work/alsa-null.conf" RIVPLAYER_FIXTURES="$work" \
     cargo test --locked --release --test learning -- --ignored
 cargo build --locked --release
-player=target/release/rvideoplayer
+player=target/release/rivplayer
 tracks=$("$player" --check --software --video-track 2 --audio-track 3 --seek 13 "$work/bbb-320x240-2video-2audio.mp4")
 printf '%s\n' "$tracks"
 [[ $tracks == *'video #2 h264 320x240 (selected)'* && $tracks == *'audio #3 aac (selected)'* ]]

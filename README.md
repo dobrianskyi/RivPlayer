@@ -1,85 +1,143 @@
-# RVideoPlayer
+# RivPlayer
 
-Нативный Linux-видеоплеер на Rust. Откройте файл аргументом командной строки, через `Ctrl+O` или перетащите его в окно.
+RivPlayer is a native Linux video player written in Rust for local MP4, MKV, WebM, MOV, AVI, MPEG-TS, and more. Tested video codecs include H.264, H.265 (HEVC), AV1, VP8, and VP9.
 
-## Сборка и запуск
+**One binary with built-in codecs.** RivPlayer compiles its container readers and software decoders directly into the executable. Play supported files without installing codec packs, FFmpeg, GStreamer, or libmpv. Optional VA-API decoding uses a compatible GPU and driver. Software decoding is available on the CPU.
 
-Для сборки нужны Rust 1.95+, системный линкер, pkg-config и заголовки ALSA. При запуске используются системный OpenGL через EGL/GLX, Wayland или X11 и аудиовыход ALSA. Диалог открытия файла использует XDG Desktop Portal. VA-API загружается при наличии libva и поддерживаемого драйвера GPU.
+RivPlayer already plays standalone audio files such as MP3 and FLAC. A dedicated music interface and support for more audio formats are planned.
+
+## Interface
+
+![RivPlayer with a clock overlay, captions, and a frame preview above the red timeline](docs/screenshots/playback.png)
+
+The YouTube-inspired layout keeps the seek bar, volume, **CC**, settings, and fullscreen controls close at hand. Hover over the timeline to preview a frame and its timestamp. Click the timeline, scroll over the video, or use the arrow keys to seek. The folder button opens a file, and the arrow beside it opens the library.
+
+![RivPlayer with playback history and library tabs beside the video](docs/screenshots/library.png)
+
+- **History** shows recently opened files and their saved positions. Select an entry to pick up where you left off.
+- **Playlist** keeps files in order and can play the next item automatically. Add files with **Add Files** or drag them into the list.
+- **Favorites** keeps selected files within reach. Choose **Add to Favorites** from the context menu in the history or playlist.
+
+![RivPlayer with an active subtitle line, timestamped dialogue, and a repositioned clock](docs/screenshots/subtitles.png)
+
+Enable **Subtitles** in the settings menu, then use **CC** to choose an embedded track or open a subtitle file. The **Subtitles** tab lists timestamped lines. Select a line to jump to it, use **Replay** to hear it again, or enable **Repeat line** to loop it. The current line is highlighted, and auto-scroll is optional.
+
+The **Time** setting shows a clock. Drag the clock or subtitles to move them within the video. Positions are saved per file, and double-clicking an overlay resets its position. The screenshots use *Blue Hour*, a demo clip created for RivPlayer.
+
+## Download
+
+[GitHub Releases](https://github.com/dobrianskyi/RivPlayer/releases) provides an Arch Linux package and a Linux x86_64 archive with the executable.
+
+**Arch Linux**
+
+```sh
+sudo pacman -U ./rivplayer-0.1.0-1-x86_64.pkg.tar.zst
+```
+
+**Linux x86_64 archive**
+
+```sh
+tar -xzf rivplayer-0.1.0-linux-x86_64.tar.gz
+cd rivplayer-0.1.0-linux-x86_64
+./rivplayer "/path/to/video.mp4"
+```
+
+RivPlayer uses the system's OpenGL and ALSA libraries for graphics and sound, with native Wayland and X11 window backends. The file chooser can use XDG Desktop Portal. Hardware decoding uses libva when a compatible driver is available.
+
+## Build from source
+
+Building requires Rust 1.95 or newer, a system linker, pkg-config, and ALSA development headers.
 
 ```sh
 cargo build --release --locked
-./target/release/rvideoplayer "/path/to/video.mp4"
+./target/release/rivplayer "/path/to/video.mp4"
 ```
 
-Для SIMD в rav1d на x86-64 установите NASM и соберите с `--features av1-simd`. Обычная сборка содержит многопоточный rav1d без ассемблерных SIMD-ядер и SIMD-оптимизации Symphonia. Флаг `--software` принудительно включает программное декодирование. Флаг `--vaapi` требует успешного аппаратного декодирования. В обычном режиме при отказе VA-API воспроизведение продолжается через программный декодер. Сборка с `--no-default-features` компилируется без VA-API.
+Install NASM and build with `--features av1-simd` to enable rav1d's assembly SIMD kernels on x86-64. The default build includes multithreaded rav1d and Symphonia's SIMD optimizations.
 
-## Воспроизведение
+- `--software` forces software decoding.
+- `--vaapi` requires hardware decoding. In automatic mode, playback falls back to software if VA-API fails.
+- `--no-default-features` is a Cargo build option that excludes VA-API.
 
-- Контрольные сочетания контейнеров, видео и аудио перечислены в матрице ниже. Декодеры VP8, MPEG-1/2, AC-3, E-AC-3 и DTS Core входят в сборку на базе OxideAV. ALAC использует модуль Symphonia.
-- `K` или пробел ставят на паузу. `J/L` и стрелки влево/вправо перематывают. `0–9` переходят к доле длительности. `F` переключает полноэкранный режим, `Esc` закрывает меню или выводит из полноэкранного режима.
-- Наведение на значок звука показывает ползунок и текущий процент. При достижении 100% справа появляется участок усиления до 200%. Громкость меняют ползунок, колёсико над ним или стрелки вверх и вниз. `M` выключает и возвращает звук плеера. `C` переключает субтитры. Внешние SRT, WebVTT, ASS/SSA, PGS (`.sup`) и VobSub (`.idx` с соседним `.sub`) можно открыть из меню или перетащить поверх видео. Файлы с тем же именем рядом с видео подхватываются автоматически. ASS/SSA выводятся как текст. Стили, позиционирование и анимации ASS/SSA, а также встроенные PGS/VobSub пока не поддерживаются.
-- В меню шестерёнки настраиваются скорость 0,25–2× с сохранением высоты тона, субтитры и дорожки. **Video track** доступен, если в файле несколько видеодорожек.
+### Build the Arch Linux package
 
-Модуль [источников](src/source.rs) передаёт движку поток с произвольным доступом или демультиплексор для источников с раздельным видео и аудио. [Движок](src/engine) управляет демультиплексированием, декодированием, очередями, синхронизацией, перемоткой и звуком. [Интерфейс](src/ui) рисует кадр и преобразует YUV в RGB на GPU. Реализации контейнеров и программных декодеров компилируются в бинарник. Движок использует [OxideAV](https://github.com/OxideAV/oxideav-workspace), [rav1d](https://github.com/memorysafety/rav1d), [Symphonia](https://github.com/pdeljanov/Symphonia) и закреплённую ревизию [VA-API адаптера OxideAV](https://github.com/OxideAV/oxideav-vaapi/pull/6).
+```sh
+cargo build --release --locked
+./scripts/package-arch.sh --install
+```
 
-Аппаратный путь использует VA-API с чтением поверхностей в память и загрузкой плоскостей на GPU для рендеринга. Интеграция Vulkan Video и YouTube-клиента остаётся отдельной работой. Плеер рассчитан на медиафайлы без DRM. Проверка кодеков охватывает перечисленные контрольные образцы.
+The packaging script takes the executable from `target/release/rivplayer` and writes the Arch Linux package to `dist/`. Add `--install` to install it with pacman. The package registers RivPlayer in the application menu and in **Open With** for supported video types. KDE can also use it as the default video player.
 
-## Библиотека и перемотка
+## Playback and library
 
-- При запуске без аргументов последнее видео открывается на паузе в сохранённой позиции. Если файл недоступен, показывается стартовый экран. Файл, дошедший до конца, открывается с начала. `--seek 0` явно начинает просмотр с нуля для файла из командной строки.
-- Стрелка рядом с кнопкой открытия добавляет библиотеку справа от видео. При закрытии возвращается прежняя ширина окна. Видимость панели, активная вкладка и выбранный плейлист сохраняются между запусками. При открытии файла окно подбирает пропорции по кадру и учитывает размер экрана. При ручном изменении окна кадр вписывается целиком с сохранением пропорций.
-- В **History**, **Playlist** и **Favorites** порядок можно менять за миниатюру или ручку перетаскивания. Наведение на запись показывает полное имя и путь. По правому клику доступны **Open in File Manager**, **Add to Favorites** и **Remove from Favorites**. Звезда открывает Favorites, а корзина очищает историю или текущий плейлист.
-- **Open Playlist** открывает сохранённый список в боковой панели. **Add Files** и перетаскивание в область списка добавляют файлы в выбранный плейлист, по умолчанию в **Default Playlist**. Перетаскивание нескольких файлов на видео также запускает первый из них.
-- История, плейлисты, избранное и настройки хранятся в `$XDG_DATA_HOME/rvideoplayer/library.sqlite3`. Если переменная отсутствует, используется `~/.local/share/rvideoplayer/library.sqlite3`.
-- По правому клику на видео доступны **File → Open…**, **Settings** и **File Information**. На вкладке **Controls** настраиваются действия одиночного и двойного клика и шаг перемотки колёсиком. По умолчанию это Play/Pause, полноэкранный режим и 5 секунд соответственно. Колёсико над значком громкости по-прежнему меняет громкость. **About** перечисляет форматы, а **File Information** показывает параметры открытого файла и активный декодер.
-- Наведение или перетаскивание по шкале запрашивает кадр в отдельном рабочем потоке с кэшем на 48 миниатюр. Play и Pause показывают короткую центральную анимацию. Пауза останавливает часы и освобождает очереди, а возобновление синхронизирует дорожки с сохранённой позицией.
-- Перетаскивание локальных файлов работает в X11 и нативном Wayland. Композитор Wayland управляет размещением окна. Для принудительного выбора используйте `RVIDEOPLAYER_WAYLAND=0` для X11 или `RVIDEOPLAYER_WAYLAND=1` для Wayland.
+- Open a file from the command line, press `Ctrl+O`, or drag a file onto the window. Without an argument, RivPlayer reopens the most recent available video at the saved position, paused. Completed videos start from the beginning. Use `--seek 0` to open a file explicitly at the beginning.
+- Press `Space` or `K` for play and pause. Use `J`, `L`, `←`, or `→` to seek. The `0`–`9` keys jump to a fraction of the video. Press `F` for fullscreen and `Esc` to close a menu or leave fullscreen.
+- The volume slider expands to offer up to 200% gain once it reaches 100%. Adjust volume with the slider, the wheel over the volume icon, or `↑` and `↓`. Use `M` to toggle mute and `C` to toggle subtitles.
+- The settings menu offers pitch-preserving playback speeds from 0.25× to 2×. **Video track** appears when multiple video tracks are available. **Audio** selects an embedded track or loads an external audio file. The external selection is remembered per video. If the external file becomes unavailable, playback uses an embedded track. **Use original audio** restores the embedded track and clears the saved external selection.
+- Videos fit inside the window while preserving their aspect ratio. The library opens to the right of the video. Its visibility, selected tab, and current playlist are saved.
+- Reorder entries in **History**, **Playlist**, or **Favorites** by dragging the thumbnail or handle. Hover over an entry to see its full name and path. The context menu offers **Open in File Manager** and library actions. **Clear all history** and **Clear all playlist** clear entries from their lists.
+- **Open Playlist** selects a saved list. New files go to the selected playlist or **Default Playlist**. Dropping multiple files onto the video area also starts the first file.
+- Right-click the video for **File → Open…**, **Settings**, and **File Information**. **Settings → Controls** configures single-click and double-click actions and the scroll-wheel seek step. The defaults are play/pause, fullscreen, and five seconds. **File Information** shows file details and the active decoder.
+- Seek previews are generated in a background thread and cached. Play and pause display a short overlay. Pausing stops the playback clock and releases queued samples. Resuming synchronizes video and audio to the saved position.
+- KDE media keys and the media widget use MPRIS for play, pause, seeking, and playlist navigation.
+- Local file drops work on X11 and native Wayland. Use `RIVPLAYER_WAYLAND=0` for X11 or `RIVPLAYER_WAYLAND=1` for Wayland.
 
-## Изучение языка
+History, playlists, favorites, and settings live in `$XDG_DATA_HOME/rivplayer/library.sqlite3`, with `~/.local/share/rivplayer/library.sqlite3` as the default. When upgrading from RVideoPlayer, RivPlayer automatically opens the existing database in the `rvideoplayer` directory if a new database has yet to be created.
 
-- **Subtitles** в меню шестерёнки позволяет выбрать дорожку, открыть внешний файл и скрыть субтитры на видео. **Show subtitle panel** или `Shift+C` открывает боковую панель реплик. Нажатие на реплику перематывает к её началу. **Auto-scroll** управляет прокруткой, а **Show on video** — отображением поверх видео. Полный список встроенных реплик читается в фоновом потоке. У внешних PGS и VobSub список показывает время появления изображения.
-- `Shift+←` и `Shift+→` переходят между репликами. `Shift+↓` заново проигрывает текущую реплику, `Shift+↑` включает или выключает её повтор. Те же действия доступны в панели. Чтобы зациклить любую реплику, нажмите на неё правой кнопкой и выберите **Repeat this line**.
-- `[` отмечает A, `]` отмечает B и включает повтор фрагмента. `Shift+L` приостанавливает или включает повтор, `Shift+R` сбрасывает метки. Метки возвращаются при повторном открытии файла, а повтор нужно включить явно. Плеер заранее готовит следующий проход и использует общий момент перехода для аудиовыхода и видео. Когда декодер ещё готовит кадры, используется обычная перемотка.
-- **A–B** в меню шестерёнки в один клик показывает или скрывает кнопки над таймлайном. Выбор сохраняется между запусками. Метки и горячие клавиши доступны и при скрытых кнопках.
-- Переключатель **Time** в шестерёнке управляет часами. Размер выбирается в **Player settings → General**. Часы и видимые субтитры можно перетащить мышью. Позиции сохраняются отдельно для каждого видео.
-- **Alarm** в меню шестерёнки открывает таймер на 30, 45, 60 или 120 минут либо на выбранное число часов и минут. Значок будильника в нижней панели открывает настройки активного таймера. По истечении таймера плеер ставит видео на паузу и показывает уведомление по центру кадра. Таймер действует до закрытия плеера.
-- **Voice Boost** в меню шестерёнки применяется во время воспроизведения. Эффект выделяет центральный канал, когда он доступен и активен, или усиливает среднюю составляющую стерео в речевом диапазоне. Настройка не разделяет голос и музыку на отдельные дорожки.
-- SQLite сохраняет скорость, громкость, mute, Voice Boost, видимость субтитров, автопрокрутку и открытую панель. Для каждого файла сохраняются дорожки, позиция и метки A–B.
+## Subtitles and language learning
 
-## Проверенные сочетания контейнеров и кодеков
+- **Subtitles → On** in the settings menu enables **CC**. Use **CC** to choose a track, open an external file, toggle **Show on video**, or select **Turn subtitles off**. **Show subtitle panel** or `Shift+C` opens the transcript. Embedded text cues are indexed in the background.
+- Load external SRT, WebVTT, ASS/SSA, PGS (`.sup`), or VobSub (`.idx` with a matching `.sub`) from the menu or drop them onto the video. Files with the same base name as the video load automatically. ASS/SSA renders as plain text. The transcript lists timestamps for external bitmap subtitles.
+- `Shift+←` and `Shift+→` move between lines. `Shift+↓` replays the active line. `Shift+↑` toggles its loop. Right-click any line and select **Repeat this line** to loop it.
+- Press `[` to set A and `]` to set B and start repeating. `Shift+L` toggles the loop, and `Shift+R` clears both points. Points are restored per file, with repeat re-enabled manually. The player prepares the next pass while the current one is playing. **A–B** in the settings menu shows or hides the timeline buttons.
+- **Time** shows a draggable clock. Set its size in **Settings → General**. **Alarm** pauses the video and shows an in-player alert after 30, 45, 60, or 120 minutes, or a custom interval.
+- **Voice Boost** in the **Audio** menu emphasizes an active center channel on surround tracks or boosts the speech range in the stereo center. Toggle it during playback.
+- Playback settings are saved locally. Subtitle and audio tracks, playback position, A–B points, and overlay positions can be restored per file.
 
-| Контейнер | Контрольные сочетания |
+## Tested containers and codecs
+
+This table lists combinations exercised with actual media files. Support for a container depends on the codecs inside it.
+
+| Container | Tested combinations |
 | --- | --- |
-| MP4 / M4A, включая фрагментированный MP4 | H.264/AAC-LC, H.265 Main 10/AAC-LC, AV1/Opus, ALAC в M4A, отдельные AC-3 и E-AC-3 в fMP4 |
-| MKV / WebM | H.264 и VP8/DTS Core 5.1 в MKV, VP8/Vorbis, VP9/Opus и AV1 в WebM |
-| MOV | H.264, PCM, ALAC 24 бит и 6 каналов |
-| AVI | MPEG-4 Part 2 / MP3 или AC-3 |
-| MPEG-TS / M2TS | H.264/AAC-LC, MPEG-2/MP2 |
+| MP4 / M4A, including fragmented MP4 | H.264/AAC-LC, H.265 Main 10/AAC-LC, AV1/Opus, ALAC in M4A, and standalone AC-3 and E-AC-3 tracks in fMP4 |
+| MKV / WebM | H.264 and VP8/DTS Core 5.1 in MKV, VP8/Vorbis, VP9/Opus, and AV1 in WebM |
+| MOV | H.264, PCM, 24-bit ALAC, and six-channel ALAC |
+| AVI | MPEG-4 Part 2 with MP3 or AC-3 |
+| MPEG-TS / M2TS | H.264/AAC-LC and MPEG-2/MP2 |
 | MPEG-1 System | MPEG-1/MP2 |
-| MPEG-PS / VOB | MPEG-2/MP2, MPEG-2/AC-3 |
-| M4V | H.264 с переменной частотой кадров |
+| MPEG-PS / VOB | MPEG-2/MP2 and MPEG-2/AC-3 |
+| M4V | Variable-frame-rate H.264 |
 | FLV | H.264/AAC-LC |
 | Ogg / OGV | Theora/Vorbis |
 | 3GP | H.264/AAC-LC |
-| Отдельные аудиофайлы | MP3, FLAC, AC-3, E-AC-3 |
+| Standalone audio files | MP3, FLAC, AC-3, and E-AC-3 |
 
-Для точной перемотки движку нужен предшествующий ключевой кадр. В MPEG-PS и FLV без индекса плеер просматривает сжатые пакеты и начинает декодирование с подходящего ключевого кадра. При отсутствии такой точки используется проход с начала файла. Миниатюры появляются у файлов с известной длительностью.
+### Current limitations
 
-Битый кадр MPEG-2 можно восстановить копией опорного кадра, а неполный кадр AC-3 в конце потока пропускается. На `TITLE01-ANGLE1.VOB` это позволяет доиграть файл и перематывать. AC-3 и E-AC-3 сохраняют исходные каналы до стереомикса на выходе. В образцах Chromium `bear.ogv`, `bear.m2ts` и `bear.avi` сходная зелёная кромка присутствует в плоскости Cr ещё до рендеринга. У независимого образца Theora `VID_0001.ogg` и проверенного VOB такой кромки не обнаружено. [Chromium описывает происхождение всех трёх образцов](https://chromium.googlesource.com/chromium/src/%2Bshow/35bdfd670af4dff0df5aa6f27c5781affbc84070/media/test/data/README.md).
+RivPlayer targets local media without DRM. DTS-HD, TrueHD, WMA, WMV, VC-1, Sorenson Spark, embedded PGS/VobSub, and ASS/SSA styling and animation are outside the current support matrix. Seek thumbnails require a known duration. In unindexed MPEG-PS and FLV files, RivPlayer scans compressed packets for a keyframe and may need to decode from the start if it cannot find one.
 
-Проверенные дополнения используют [OxideAV AC-3](https://github.com/OxideAV/oxideav-ac3), [OxideAV VP8](https://github.com/OxideAV/oxideav-vp8) и [OxideAV DTS](https://github.com/OxideAV/oxideav-dts/tree/08ba76f53a02f054a656024a8a3e7b9c7cf498f7) под MIT, [Symphonia ALAC](https://github.com/pdeljanov/Symphonia) под MPL-2.0, [Veloce MPEG](https://docs.rs/crate/veloce-mpegts/0.1.7/source/) под MIT или Apache-2.0 и [libbitsub-core](https://github.com/altqx/libbitsub) под MIT. Для DTS Core закреплена ревизия с исправлениями уровня PCM и таблиц масштабирования. DTS-HD и TrueHD не заявлены как поддерживаемые. WMA, WMV, VC-1 и Sorenson Spark также вне текущей матрицы.
+For damaged MPEG-2, the decoder can use a reference frame to conceal an error. It can also skip a truncated AC-3 packet at the end of a file. The test suite exercises these paths with `TITLE01-ANGLE1.VOB`. Some Chromium samples have a green edge in the decoded chroma data. The repository documents the [sample sources](https://chromium.googlesource.com/chromium/src/%2Bshow/35bdfd670af4dff0df5aa6f27c5781affbc84070/media/test/data/README.md).
 
-## Проверка на медиафайлах
+## Architecture
+
+The [source layer](src/source.rs) gives the [playback engine](src/engine) random access to media or hands it a demuxer for split video and audio sources. The engine handles demuxing, decoding, seeking, synchronization, audio, and frame queues. The [UI](src/ui) displays frames and converts YUV to RGB in OpenGL.
+
+The engine uses [OxideAV](https://github.com/OxideAV/oxideav-workspace), [rav1d](https://github.com/memorysafety/rav1d), [Symphonia](https://github.com/pdeljanov/Symphonia), and a pinned revision of an [OxideAV VA-API adapter](https://github.com/OxideAV/oxideav-vaapi/pull/6). The decoded video queue has a 48 MiB budget per decoding session, with room for one larger frame when the queue is empty. With VA-API, decoded surfaces pass through system memory before upload to OpenGL. Ten-bit P010 frames keep their native plane layout. Vulkan Video and a YouTube client are future work.
+
+## Test with media files
 
 ```sh
-./target/release/rvideoplayer --check --software video.mp4
-./target/release/rvideoplayer --check --vaapi --seek 1.5 video.mp4
+./target/release/rivplayer --check --software video.mp4
+./target/release/rivplayer --check --vaapi --seek 1.5 video.mp4
 ./scripts/check-media.sh
 ./scripts/check-media.sh --vaapi
 ./scripts/check-containers.sh
 ./scripts/check-codecs.sh
 ```
 
-`--check` проходит через тот же демультиплексор и декодеры, печатает число кадров и аудиосэмплов, диапазон PTS и контрольную сумму плоскости яркости. Скрипты скачивают файлы во временный каталог. Проверка контейнеров перепаковывает реальные дорожки Chromium в FLV, M4V и MPEG-PS и проверяет VFR, кадр для выбранной позиции, альтернативные дорожки, субтитры, паузу и возобновление, обработку повреждённого WebM. Она также проверяет переход к репликам и повтор H.264 и VP9 на разных скоростях с изолированным аудиоустройством ALSA. Образцы взяты из [Chromium media/test/data](https://chromium.googlesource.com/chromium/src/+/24db33777572825c8dc4e1fa37ece2affaa7636d/media/test/data/), [архива Chromium](https://android.googlesource.com/platform/external/chromium_org/+/21a33e9/media/test/data/) и [kodewright/dummy-data](https://github.com/kodewright/dummy-data/tree/ab8818629d31995c4de5b10460609b5c8d7baa94/videos).
+`--check` uses the same demuxers and decoders as the app and prints decoded frame and audio sample counts, presentation timestamps, and a luma checksum. The container suite tests variable frame rates, seeking, alternative tracks, subtitles, pause and resume, and malformed media. It also exercises subtitle navigation and A–B loops at different playback speeds using an isolated ALSA device. Samples come from [Chromium](https://chromium.googlesource.com/chromium/src/+/24db33777572825c8dc4e1fa37ece2affaa7636d/media/test/data/), the [Chromium archive](https://android.googlesource.com/platform/external/chromium_org/+/21a33e9/media/test/data/), and [kodewright/dummy-data](https://github.com/kodewright/dummy-data/tree/ab8818629d31995c4de5b10460609b5c8d7baa94/videos).
 
-`check-codecs.sh` проверяет временные отметки видео и PCM после перемотки, согласованность звука и изображения, VOB с повреждениями, DTS Core по эталонному PCM и растровые субтитры при переходе по времени. Используются публичные медиаобразцы Chromium, [архива ALAC](https://samples.ffmpeg.org/A-codecs/lossless/), [архива MPEG-2](https://samples.ffmpeg.org/MPEG2/), [архива DTS](https://samples.ffmpeg.org/A-codecs/DTS/), [набора DTS FATE](https://fate-suite.ffmpeg.org/dts/dcadec-suite/), [набора субтитров FATE](https://fate-suite.ffmpeg.org/sub/) и [тестов libbitsub-core](https://github.com/altqx/libbitsub/tree/73c7e795808c35f4e63965e5351228d7437627f6/crates/core/src/testfiles).
+The codec suite checks timestamps and PCM after seeks, audio/video synchronization, damaged VOB playback, DTS Core against reference PCM, and bitmap subtitles. It uses public samples from the [FFmpeg sample archive](https://samples.ffmpeg.org/), the [FATE suite](https://fate-suite.ffmpeg.org/), and [libbitsub-core](https://github.com/altqx/libbitsub/tree/73c7e795808c35f4e63965e5351228d7437627f6/crates/core/src/testfiles).
+
+Dependency licenses and source links are in the [third-party notices](docs/THIRD-PARTY-NOTICES.txt).

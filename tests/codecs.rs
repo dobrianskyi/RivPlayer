@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use oxideav_core::{CodecParameters, Packet, StreamInfo, TimeBase};
-use rvideoplayer::{
+use rivplayer::{
     engine::{self, Captions, DecodeMode, Event, Options, Player},
     source::{LocalFile, MediaSource, runtime},
 };
@@ -97,7 +97,7 @@ fn decode(path: &Path, position: f64) -> Result<Playback> {
 #[ignore = "run scripts/check-codecs.sh to fetch public media fixtures"]
 fn codec_playback_and_seeking() -> Result<()> {
     let dir = PathBuf::from(
-        std::env::var_os("RVIDEOPLAYER_CODEC_FIXTURES").context("Missing fixture directory")?,
+        std::env::var_os("RIVPLAYER_CODEC_FIXTURES").context("Missing fixture directory")?,
     );
     let dts = dir.join("bear-dts-core.mkv");
     let film = std::fs::read(dir.join("lotr_5.1_768.dts"))?;
@@ -220,7 +220,7 @@ fn mux_dts(path: &Path, input: &[u8], video: Option<&Path>, max: usize) -> Resul
 #[ignore = "run scripts/check-codecs.sh to fetch public DTS and PCM fixtures"]
 fn dts_core_matches_reference_pcm() -> Result<()> {
     let dir = PathBuf::from(
-        std::env::var_os("RVIDEOPLAYER_CODEC_FIXTURES").context("Missing fixture directory")?,
+        std::env::var_os("RIVPLAYER_CODEC_FIXTURES").context("Missing fixture directory")?,
     );
     let reference = std::fs::read(dir.join("core_51_24_48_768_0.f32"))?;
     let source = std::fs::read(dir.join("core_51_24_48_768_0.dtshd"))?;
@@ -261,7 +261,7 @@ fn dts_core_matches_reference_pcm() -> Result<()> {
 #[ignore = "run scripts/check-codecs.sh to fetch public subtitle fixtures"]
 fn external_subtitles_follow_the_timeline() -> Result<()> {
     let dir = PathBuf::from(
-        std::env::var_os("RVIDEOPLAYER_CODEC_FIXTURES").context("Missing fixture directory")?,
+        std::env::var_os("RIVPLAYER_CODEC_FIXTURES").context("Missing fixture directory")?,
     );
     for name in [
         "SubRip_capability_tester.srt",

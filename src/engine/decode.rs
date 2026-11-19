@@ -28,6 +28,8 @@ pub struct Picture {
     pub width: u32,
     pub height: u32,
     pub format: PixelFormat,
+    // OxideAV has no P010 variant. In that case `format` describes the NV12 plane geometry.
+    pub p010: bool,
     pub color: oxideav_core::ColorSignal,
     pub frame: VideoFrame,
 }
@@ -156,6 +158,7 @@ impl VideoDecoder {
                                 width,
                                 height,
                                 format,
+                                p010: false,
                                 color,
                                 frame,
                             });
@@ -200,6 +203,7 @@ impl MpegVideo {
                 width,
                 height,
                 format,
+                p010: false,
                 color: self.color,
                 frame,
             });

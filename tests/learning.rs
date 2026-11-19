@@ -6,17 +6,15 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use rvideoplayer::{
+use rivplayer::{
     engine::{Captions, DecodeMode, Player, Repeat, active_cue},
     source::LocalFile,
 };
 
 fn fixture(name: &str) -> Result<Arc<LocalFile>> {
     Ok(Arc::new(LocalFile(
-        PathBuf::from(
-            std::env::var_os("RVIDEOPLAYER_FIXTURES").context("Missing fixture directory")?,
-        )
-        .join(name),
+        PathBuf::from(std::env::var_os("RIVPLAYER_FIXTURES").context("Missing fixture directory")?)
+            .join(name),
     )))
 }
 

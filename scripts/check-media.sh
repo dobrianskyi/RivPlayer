@@ -2,7 +2,7 @@
 set -euo pipefail
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-player=${RVIDEOPLAYER_BIN:-"$root/target/release/rvideoplayer"}
+player=${RIVPLAYER_BIN:-"$root/target/release/rivplayer"}
 if [[ ! -x $player ]]; then
     printf 'Build first with cargo build --release --locked\n' >&2
     exit 1

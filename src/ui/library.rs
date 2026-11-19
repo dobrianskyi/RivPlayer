@@ -40,17 +40,41 @@ pub struct Playlist {
 }
 
 impl Library {
-    pub fn open() -> Result<Self> {
-        let dir = std::env::var_os("XDG_DATA_HOME")
+    pub fn open_for_startup() -> Result<(Self, Option<String>)> {
+        match Self::open() {
+            Ok(db) => Ok((db, None)),
+            Err(err) if Self::is_busy(&err) => Err(err),
+            Err(err) => Ok((
+                Self::temporary()?,
+                Some(format!("Temporary library · {err:#}")),
+            )),
+        }
+    }
+
+    pub fn is_busy(err: &anyhow::Error) -> bool {
+        matches!(
+            err.downcast_ref::<rusqlite::Error>()
+                .and_then(rusqlite::Error::sqlite_error_code),
+            Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked),
+        )
+    }
+
+    fn open() -> Result<Self> {
+        let data = std::env::var_os("XDG_DATA_HOME")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .or_else(|| {
                 std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
             })
-            .context("Local data directory is unavailable")?
-            .join("rvideoplayer");
+            .context("Local data directory is unavailable")?;
+        let dir = data.join("rivplayer");
+        let path = dir.join("library.sqlite3");
+        let legacy = data.join("rvideoplayer/library.sqlite3");
+        if !path.try_exists()? && legacy.try_exists()? {
+            return Self::init(Connection::open(legacy)?);
+        }
         fs::create_dir_all(&dir)?;
-        Self::init(Connection::open(dir.join("library.sqlite3"))?)
+        Self::init(Connection::open(path)?)
     }
 
     pub fn temporary() -> Result<Self> {
@@ -58,7 +82,7 @@ impl Library {
     }
 
     fn init(mut db: Connection) -> Result<Self> {
-        db.busy_timeout(Duration::from_millis(80))?;
+        db.busy_timeout(Duration::ZERO)?;
         db.execute_batch(
             "PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS history (
@@ -151,10 +175,12 @@ impl Library {
                 "clock_size",
                 "INTEGER NOT NULL DEFAULT 1",
             ),
+            ("playback_preferences", "show_cc", "INTEGER"),
             ("media_preferences", "clock_x", "REAL"),
             ("media_preferences", "clock_y", "REAL"),
             ("media_preferences", "caption_x", "REAL"),
             ("media_preferences", "caption_y", "REAL"),
+            ("media_preferences", "external_audio_path", "BLOB"),
         ] {
             let exists: bool = schema.query_row(
                 "SELECT EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
@@ -184,6 +210,7 @@ impl Library {
             "INSERT OR IGNORE INTO playlists (id, name) VALUES (?1, 'Default Playlist')",
             [DEFAULT_PLAYLIST],
         )?;
+        db.busy_timeout(Duration::from_millis(80))?;
         Ok(Self(db))
     }
 
@@ -210,7 +237,8 @@ impl Library {
 
     pub fn playback_settings(&self) -> Result<PlaybackSettings> {
         Ok(self.0.query_row(
-            "SELECT rate, volume, muted, voice, captions, follow, show_ab, show_clock, clock_size
+            "SELECT rate, volume, muted, voice, captions, follow, show_ab, show_clock, clock_size,
+                    COALESCE(show_cc, captions)
              FROM playback_preferences WHERE id = 1",
             [],
             |row| {
@@ -230,6 +258,7 @@ impl Library {
                     muted: row.get(2)?,
                     voice: row.get(3)?,
                     captions: row.get(4)?,
+                    show_cc: row.get(9)?,
                     follow: row.get(5)?,
                     show_ab: row.get(6)?,
                     show_clock: row.get(7)?,
@@ -246,9 +275,9 @@ impl Library {
     pub fn save_playback_settings(&self, settings: PlaybackSettings) -> Result<()> {
         self.0.execute(
             "UPDATE playback_preferences SET rate=?1, volume=?2, muted=?3, voice=?4, captions=?5, follow=?6, show_ab=?7,
-                    show_clock=?8, clock_size=?9 WHERE id=1",
+                    show_clock=?8, clock_size=?9, show_cc=?10 WHERE id=1",
             params![settings.rate, settings.volume, settings.muted, settings.voice, settings.captions, settings.follow,
-                    settings.show_ab, settings.show_clock, settings.clock_size as u8],
+                    settings.show_ab, settings.show_clock, settings.clock_size as u8, settings.show_cc],
         )?;
         Ok(())
     }
@@ -256,7 +285,7 @@ impl Library {
     pub fn media_settings(&self, path: &Path) -> Result<MediaSettings> {
         Ok(self.0.query_row(
             "SELECT subtitle_kind, subtitle_track, subtitle_path, loop_a, loop_b, video_track, audio_track,
-                    clock_x, clock_y, caption_x, caption_y
+                    clock_x, clock_y, caption_x, caption_y, external_audio_path
              FROM media_preferences WHERE path=?1",
             [path.as_os_str().as_bytes()],
             |row| {
@@ -273,6 +302,7 @@ impl Library {
                     b: b.filter(|b| b.is_finite() && a.is_some_and(|a| *b - a >= 0.08)),
                     video: row.get(5)?,
                     audio: row.get(6)?,
+                    external_audio: row.get::<_, Option<Vec<u8>>>(11)?.map(load_path),
                     clock_position: overlay_position(row.get(7)?, row.get(8)?),
                     caption_position: overlay_position(row.get(9)?, row.get(10)?),
                 })
@@ -290,16 +320,18 @@ impl Library {
         };
         self.0.execute(
             "INSERT INTO media_preferences(path, subtitle_kind, subtitle_track, subtitle_path, loop_a, loop_b, video_track, audio_track,
-                                           clock_x, clock_y, caption_x, caption_y)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                                           clock_x, clock_y, caption_x, caption_y, external_audio_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(path) DO UPDATE SET subtitle_kind=excluded.subtitle_kind, subtitle_track=excluded.subtitle_track,
                                              subtitle_path=excluded.subtitle_path, loop_a=excluded.loop_a, loop_b=excluded.loop_b,
                                              video_track=excluded.video_track, audio_track=excluded.audio_track,
                                              clock_x=excluded.clock_x, clock_y=excluded.clock_y,
-                                             caption_x=excluded.caption_x, caption_y=excluded.caption_y",
+                                             caption_x=excluded.caption_x, caption_y=excluded.caption_y,
+                                             external_audio_path=excluded.external_audio_path",
              params![path.as_os_str().as_bytes(), kind, track, sidecar, settings.a, settings.b, settings.video, settings.audio,
                      settings.clock_position.map(|p| p.x), settings.clock_position.map(|p| p.y),
-                     settings.caption_position.map(|p| p.x), settings.caption_position.map(|p| p.y)],
+                     settings.caption_position.map(|p| p.x), settings.caption_position.map(|p| p.y),
+                     settings.external_audio.as_ref().map(|p| p.as_os_str().as_bytes())],
         )?;
         Ok(())
     }
@@ -406,6 +438,24 @@ impl Library {
 
     pub fn entries(&self, list: List) -> Result<Vec<Entry>> {
         entries(&self.0, list)
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.0.total_changes()
+    }
+
+    pub fn adjacent_playlist_item(
+        &self,
+        playlist: i64,
+        item: i64,
+        forward: bool,
+    ) -> Result<Option<(PathBuf, i64)>> {
+        let (comparison, order) = if forward { (">", "ASC") } else { ("<", "DESC") };
+        Ok(self.0.prepare_cached(&format!(
+            "SELECT path, id FROM items WHERE playlist=?1
+             AND (ordinal, id) {comparison} (SELECT ordinal, id FROM items WHERE playlist=?1 AND id=?2)
+             ORDER BY ordinal {order}, id {order} LIMIT 1"
+        ))?.query_row([playlist, item], |r| Ok((load_path(r.get(0)?), r.get(1)?))).optional()?)
     }
 
     pub fn favorite_paths(&self) -> Result<std::collections::HashSet<PathBuf>> {
@@ -706,6 +756,7 @@ mod tests {
             muted: true,
             voice: true,
             captions: true,
+            show_cc: true,
             follow: false,
             show_ab: false,
             show_clock: true,
@@ -722,6 +773,7 @@ mod tests {
             subtitles: SubtitleChoice::Sidecar(Some(load_path(b"/tmp/dialog-\xFF.ass".to_vec()))),
             video: Some(1),
             audio: Some(2),
+            external_audio: Some(load_path(b"/tmp/dialog-\xFF.flac".to_vec())),
             a: Some(6.12),
             b: Some(9.84),
             clock_position: Some(OverlayPosition { x: 0.30, y: 0.72 }),
@@ -750,14 +802,14 @@ mod tests {
     }
 
     #[test]
-    fn existing_playback_settings_gain_visible_ab_controls() -> Result<()> {
+    fn existing_playback_settings_restore_subtitle_and_ab_controls() -> Result<()> {
         let db = Connection::open_in_memory()?;
         db.execute_batch(
             "CREATE TABLE playback_preferences (
                  id INTEGER PRIMARY KEY,
                  rate REAL, volume REAL, muted INTEGER, voice INTEGER, captions INTEGER, follow INTEGER
              );
-             INSERT INTO playback_preferences VALUES (1, 1.25, 1.5, 0, 1, 0, 0);",
+             INSERT INTO playback_preferences VALUES (1, 1.25, 1.5, 0, 1, 1, 0);",
         )?;
         let db = Library::init(db)?;
         assert_eq!(
@@ -766,10 +818,101 @@ mod tests {
                 rate: 1.25,
                 volume: 1.5,
                 voice: true,
+                captions: true,
+                show_cc: true,
                 follow: false,
                 ..Default::default()
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn existing_media_preferences_gain_an_optional_external_audio_path() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch(
+            "CREATE TABLE media_preferences (
+                 path BLOB PRIMARY KEY, subtitle_kind INTEGER NOT NULL,
+                 subtitle_track INTEGER, subtitle_path BLOB, video_track INTEGER,
+                 audio_track INTEGER, loop_a REAL, loop_b REAL
+             );
+             INSERT INTO media_preferences VALUES (CAST('movie.mp4' AS BLOB), 1, 4, NULL, 3, 2, 2, 4);",
+        )?;
+        let db = Library::init(db)?;
+        let mut settings = db.media_settings(Path::new("movie.mp4"))?;
+        assert_eq!(settings.subtitles, SubtitleChoice::Embedded(4));
+        assert_eq!(settings.audio, Some(2));
+        assert_eq!(settings.external_audio, None);
+        settings.external_audio = Some(PathBuf::from("dialogue.flac"));
+        db.save_media_settings(Path::new("movie.mp4"), &settings)?;
+        settings.external_audio = None;
+        db.save_media_settings(Path::new("movie.mp4"), &settings)?;
+        assert_eq!(db.media_settings(Path::new("movie.mp4"))?, settings);
+        Ok(())
+    }
+
+    #[test]
+    fn adjacent_playlist_items_follow_the_current_order() -> Result<()> {
+        let mut db = Library::temporary()?;
+        let paths = ["a.mp4", "b.mp4", "c.mp4"].map(PathBuf::from);
+        db.append(DEFAULT_PLAYLIST, &paths)?;
+        let playlist = DEFAULT_PLAYLIST;
+        let [first, middle, last] = db
+            .entries(List::Playlist(playlist))?
+            .try_into()
+            .ok()
+            .unwrap();
+        assert_eq!(
+            db.adjacent_playlist_item(playlist, middle.id, true)?,
+            Some((paths[2].clone(), last.id))
+        );
+        assert_eq!(
+            db.adjacent_playlist_item(playlist, middle.id, false)?,
+            Some((paths[0].clone(), first.id))
+        );
+        assert!(
+            db.adjacent_playlist_item(playlist, last.id, true)?
+                .is_none()
+        );
+        db.reorder(List::Playlist(playlist), last.id, Some(first.id))?;
+        assert_eq!(
+            db.adjacent_playlist_item(playlist, first.id, false)?,
+            Some((paths[2].clone(), last.id))
+        );
+        db.remove_item(first.id)?;
+        assert!(
+            db.adjacent_playlist_item(playlist, first.id, true)?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn startup_recognizes_a_locked_library_and_reopens_it() -> Result<()> {
+        let uri = format!(
+            "file:rvp-startup-{}?mode=memory&cache=shared",
+            std::process::id()
+        );
+        let db = Library::init(Connection::open(&uri)?)?;
+        let saved = PlaybackSettings {
+            volume: 0.45,
+            ..Default::default()
+        };
+        db.save_playback_settings(saved)?;
+        let path = Path::new("resume.mp4");
+        db.save(path, 8.0, Some(24.0), false, None)?;
+
+        let mut other = Connection::open(&uri)?;
+        let lock = other.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        match Library::init(Connection::open(&uri)?) {
+            Ok(_) => anyhow::bail!("Expected a busy or locked library"),
+            Err(err) => assert!(Library::is_busy(&err), "{err:#}"),
+        }
+        lock.rollback()?;
+
+        let reopened = Library::init(Connection::open(&uri)?)?;
+        assert_eq!(reopened.playback_settings()?, saved);
+        assert_eq!(reopened.last_video()?, Some((path.to_owned(), 8.0)));
         Ok(())
     }
 

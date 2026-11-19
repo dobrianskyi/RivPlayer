@@ -105,6 +105,7 @@ pub struct Info {
     pub available_captions: Vec<Track>,
     pub current_video: Option<u32>,
     pub current_audio: Option<u32>,
+    pub external_audio: Option<Track>,
     pub backend: Option<&'static str>,
 }
 
@@ -152,17 +153,26 @@ pub fn run(
     cancel: &AtomicBool,
     emit: impl FnMut(Event) -> bool,
 ) -> Result<()> {
-    run_session(source, options, cancel, true, emit)
+    run_session(source, None, options, cancel, true, emit)
 }
 
 pub(super) fn run_session(
     source: &dyn MediaSource,
+    external_audio: Option<&dyn MediaSource>,
     options: Options,
     cancel: &AtomicBool,
     load_sidecar: bool,
     mut emit: impl FnMut(Event) -> bool,
 ) -> Result<()> {
-    guarded_decode(source, options, cancel, false, load_sidecar, &mut emit)
+    guarded_decode(
+        source,
+        external_audio,
+        options,
+        cancel,
+        false,
+        load_sidecar,
+        &mut emit,
+    )
 }
 
 pub fn preview(
@@ -188,7 +198,7 @@ pub fn sample_preview(
         mode: DecodeMode::Software,
         ..Options::default()
     };
-    guarded_decode(source, options, cancel, true, false, &mut |event| {
+    guarded_decode(source, None, options, cancel, true, false, &mut |event| {
         match event {
             Event::Info(info) => duration = info.duration,
             Event::Video(picture) => {
@@ -204,6 +214,7 @@ pub fn sample_preview(
 
 fn guarded_decode(
     source: &dyn MediaSource,
+    external_audio: Option<&dyn MediaSource>,
     options: Options,
     cancel: &AtomicBool,
     video_only: bool,
@@ -211,13 +222,22 @@ fn guarded_decode(
     emit: &mut dyn FnMut(Event) -> bool,
 ) -> Result<()> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        decode(source, options, cancel, video_only, load_sidecar, emit)
+        decode(
+            source,
+            external_audio,
+            options,
+            cancel,
+            video_only,
+            load_sidecar,
+            emit,
+        )
     }))
     .map_err(|_| anyhow::anyhow!("Decoder stopped on malformed media"))?
 }
 
 fn decode(
     source: &dyn MediaSource,
+    external_audio: Option<&dyn MediaSource>,
     options: Options,
     cancel: &AtomicBool,
     video_only: bool,
@@ -341,9 +361,35 @@ fn decode(
     if options.mode == DecodeMode::Vaapi && backend != Some("VA-API") {
         bail!("VA-API could not initialize for this stream");
     }
-    let audio = audio.filter(|_| !video_only);
+    let target = options.position.max(0.0);
+    let mut external_error = None;
+    let external = external_audio
+        .filter(|_| video.is_some())
+        .and_then(
+            |source| match ExternalAudio::open(source, &ctx, target, cancel) {
+                Ok(track) => Some(track),
+                Err(err) => {
+                    external_error = Some(format!("External audio: {err:#}"));
+                    None
+                }
+            },
+        );
+    if external_audio.is_some() && video.is_none() {
+        external_error = Some("External audio requires a video track".into());
+    }
+    let (mut external, imported_decoder) = match external {
+        Some((track, decoder)) => (Some(track), Some(decoder)),
+        None => (None, None),
+    };
+    let external_track = external.as_ref().map(|external| external.track.clone());
+    let audio = audio.filter(|_| !video_only && external_track.is_none());
+    let selected_audio = external_track.as_ref().or(audio);
     let mut audio_error = None;
-    let mut audio_decoder = match audio.map(|s| AudioDecoder::open(&s.params)).transpose() {
+    let mut audio_decoder = match if imported_decoder.is_some() {
+        Ok(imported_decoder)
+    } else {
+        audio.map(|s| AudioDecoder::open(&s.params)).transpose()
+    } {
         Ok(decoder) => decoder,
         Err(err) if video.is_some() => {
             audio_error = Some(format!("Audio unavailable: {err:#}"));
@@ -351,7 +397,6 @@ fn decode(
         }
         Err(err) => return Err(err),
     };
-    let target = options.position.max(0.0);
     let active: Vec<_> = video
         .into_iter()
         .chain(audio.filter(|_| audio_decoder.is_some()))
@@ -422,9 +467,18 @@ fn decode(
             .collect(),
         current_video: video.map(|s| s.index),
         current_audio: audio.filter(|_| audio_decoder.is_some()).map(|s| s.index),
+        external_audio: external_track
+            .as_ref()
+            .filter(|_| audio_decoder.is_some())
+            .map(Track::from),
         backend,
     };
     if !emit(Event::Info(Box::new(info))) {
+        return Ok(());
+    }
+    if let Some(err) = external_error
+        && !emit(Event::Notice(err))
+    {
         return Ok(());
     }
     if video_only && video.is_none() {
@@ -447,7 +501,7 @@ fn decode(
             return Ok(());
         }
     } else if !video_only
-        && audio.is_none()
+        && selected_audio.is_none()
         && tracks
             .iter()
             .any(|s| s.params.media_type == MediaType::Audio)
@@ -474,21 +528,44 @@ fn decode(
     let mut has_video = false;
     let mut has_audio = false;
     let mut incomplete_audio_reported = false;
+    let mut primary_packet = None;
     loop {
         if cancel.load(Ordering::Relaxed)
             || preview_deadline.is_some_and(|end| Instant::now() >= end)
         {
             return Ok(());
         }
-        let packet = match initial_packets
-            .pop_front()
-            .map_or_else(|| demux.next_packet(), Ok)
+        if primary_packet.is_none() {
+            primary_packet = match initial_packets
+                .pop_front()
+                .map_or_else(|| demux.next_packet(), Ok)
+            {
+                Ok(packet) => Some(packet),
+                Err(Error::Eof) => None,
+                Err(err) => return Err(err).context("Reading media packets"),
+            };
+        }
+        let mut external_packet = None;
+        if let (Some(ext), Some(primary)) = (&mut external, &primary_packet)
+            && audio_decoder.is_some()
         {
-            Ok(packet) => Some(packet),
-            Err(Error::Eof) => None,
-            Err(err) => return Err(err).context("Reading media packets"),
-        };
-        if let Some(s) = video
+            match ext.before(
+                decode_time(primary).map_or(target, |time| time - start) + 0.12,
+                cancel,
+            ) {
+                Ok(packet) => external_packet = packet,
+                Err(err) => {
+                    external = None;
+                    if !emit(Event::Notice(format!("External audio: {err:#}"))) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        let imported = external_packet.is_some();
+        let packet = external_packet.or_else(|| primary_packet.take());
+        if !imported
+            && let Some(s) = video
             && packet.as_ref().is_none_or(|p| {
                 p.stream_index == s.index && !(p.flags.header && !s.params.extradata.is_empty())
             })
@@ -532,8 +609,11 @@ fn decode(
         if packet.flags.header || packet.data.is_empty() {
             continue;
         }
-        if let Some(s) = audio
-            && s.index == packet.stream_index
+        if let Some(s) = if imported {
+            external_track.as_ref()
+        } else {
+            audio
+        } && s.index == packet.stream_index
             && let Some(decoder) = audio_decoder.as_mut()
         {
             // The MPEG demuxer flushes its partial access unit at EOF. Keep
@@ -556,8 +636,13 @@ fn decode(
                 incomplete_audio_reported = true;
                 continue;
             }
+            let origin = if imported {
+                external.as_ref().map_or(start, |track| track.origin)
+            } else {
+                start
+            };
             let mut time =
-                packet_time(&packet).map_or_else(|| audio_end.unwrap_or(0.0), |v| v - start);
+                packet_time(&packet).map_or_else(|| audio_end.unwrap_or(0.0), |v| v - origin);
             // Millisecond container timestamps round audio packet boundaries.
             if let Some(end) = audio_end
                 && (time - end).abs() <= 0.003
@@ -567,8 +652,9 @@ fn decode(
             let samples = match decoder.decode(&packet) {
                 Ok(samples) => samples,
                 Err(err)
-                    if video.is_some()
-                        && matches!(s.params.codec_id.as_str(), "ac3" | "eac3" | "dts") =>
+                    if imported
+                        || (video.is_some()
+                            && matches!(s.params.codec_id.as_str(), "ac3" | "eac3" | "dts")) =>
                 {
                     audio_decoder = None;
                     if !emit(Event::Notice(format!("Audio unavailable: {err:#}"))) {
@@ -597,7 +683,8 @@ fn decode(
                     return Ok(());
                 }
             }
-        } else if !video_only
+        } else if !imported
+            && !video_only
             && let Some(s) = tracks
                 .iter()
                 .filter(is_text)
@@ -633,10 +720,129 @@ fn decode(
         bail!("The file contains no decodable frames");
     }
     let end = audio_end
+        .filter(|_| external_track.is_none())
         .unwrap_or_default()
         .max(last_video.map_or(0.0, |v| v + video_step));
     emit(Event::End(end));
     Ok(())
+}
+
+struct ExternalAudio {
+    demux: Box<dyn Demuxer>,
+    track: StreamInfo,
+    origin: f64,
+    target: f64,
+    next: Option<Packet>,
+    ended: bool,
+}
+
+impl ExternalAudio {
+    fn open(
+        source: &dyn MediaSource,
+        ctx: &oxideav_core::RuntimeContext,
+        target: f64,
+        cancel: &AtomicBool,
+    ) -> Result<(Self, AudioDecoder)> {
+        let (mut demux, container) = source.open_described(ctx)?;
+        let track = demux
+            .streams()
+            .iter()
+            .find(|s| {
+                let codec = s.params.codec_id.as_str();
+                s.params.media_type == MediaType::Audio
+                    && AudioDecoder::supported(codec)
+                    && (codec != "dts" || container == "matroska")
+            })
+            .cloned()
+            .context("No supported audio track in the selected file")?;
+        let decoder = AudioDecoder::open(&track.params)?;
+        demux.set_active_streams(&[track.index]);
+        let mut next = Self::read_audio(demux.as_mut(), track.index, cancel)?;
+        let first = next.as_ref().context("The audio track is empty")?;
+        let origin = track
+            .start_time
+            .map(|t| seconds(t, track.time_base))
+            .or_else(|| packet_time(first))
+            .unwrap_or_default();
+        if target > 0.0 && !cancel.load(Ordering::Relaxed) {
+            let base = track.time_base.as_rational();
+            let preroll = (target - 0.25).max(0.0);
+            let ticks = ((preroll + origin) * base.den as f64 / base.num as f64) as i64;
+            if !matches!(demux.seek_to(track.index, ticks), Ok(actual) if actual <= ticks) {
+                demux = source.open_demuxer(ctx)?;
+                demux.set_active_streams(&[track.index]);
+            }
+            next = None;
+        }
+        Ok((
+            Self {
+                demux,
+                track,
+                origin,
+                target,
+                next,
+                ended: false,
+            },
+            decoder,
+        ))
+    }
+
+    fn read_audio(
+        demux: &mut dyn Demuxer,
+        index: u32,
+        cancel: &AtomicBool,
+    ) -> Result<Option<Packet>> {
+        while !cancel.load(Ordering::Relaxed) {
+            match demux.next_packet() {
+                Ok(packet)
+                    if packet.stream_index == index
+                        && !packet.flags.header
+                        && !packet.data.is_empty() =>
+                {
+                    return Ok(Some(packet));
+                }
+                Ok(_) => {}
+                Err(Error::Eof) => break,
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(None)
+    }
+
+    // Keep the independent audio reader close to the primary decoder timeline.
+    fn before(&mut self, time: f64, cancel: &AtomicBool) -> Result<Option<Packet>> {
+        while !self.ended {
+            if self.next.is_none() {
+                self.next = Self::read_audio(self.demux.as_mut(), self.track.index, cancel)?;
+            }
+            let Some(packet) = &self.next else {
+                self.ended = true;
+                break;
+            };
+            if let Some(pts) = packet_time(packet).map(|pts| pts - self.origin) {
+                if pts > time {
+                    break;
+                }
+                let packet_end = packet
+                    .duration
+                    .filter(|&duration| duration > 0)
+                    .map(|duration| pts + seconds(duration, packet.time_base));
+                if packet_end.is_some_and(|end| end + 0.25 < self.target) {
+                    self.next = None;
+                    continue;
+                }
+            }
+            return Ok(self.next.take());
+        }
+        Ok(None)
+    }
+}
+
+fn decode_time(packet: &Packet) -> Option<f64> {
+    packet
+        .dts
+        .or(packet.pts)
+        .map(|t| seconds(t, packet.time_base))
 }
 
 /// For unindexed files, scan compressed packets and hand the decoder only the
@@ -691,4 +897,131 @@ fn packet_time(packet: &Packet) -> Option<f64> {
         .pts
         .or(packet.dts)
         .map(|pts| seconds(pts, packet.time_base))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source::LocalFile;
+    use std::path::PathBuf;
+
+    #[test]
+    #[ignore = "run scripts/check-containers.sh to fetch the public video fixture"]
+    fn external_audio_trims_decoded_flac_block_at_seek() -> Result<()> {
+        let fixtures = PathBuf::from(std::env::var_os("RIVPLAYER_FIXTURES").unwrap());
+        let video = LocalFile(fixtures.join("bbb-320x240-2video-2audio.mp4"));
+        let audio = LocalFile(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/external-long-block.flac"),
+        );
+        // At 8 kHz, this fixture's 4096-sample blocks last 512 ms.
+        let position = 1.375;
+        let mut first_audio = None;
+        run_session(
+            &video,
+            Some(&audio),
+            Options {
+                position,
+                mode: DecodeMode::Software,
+                ..Options::default()
+            },
+            &AtomicBool::new(false),
+            false,
+            |event| {
+                if let Event::Audio(chunk) = event {
+                    first_audio = Some(chunk);
+                    return false;
+                }
+                true
+            },
+        )?;
+        let chunk =
+            first_audio.context("Expected audio from the block containing the seek target")?;
+        assert!(
+            (position..=position + 1.0 / 8000.0).contains(&chunk.time),
+            "{}",
+            chunk.time
+        );
+        assert!(chunk.samples.data.iter().any(|sample| sample.abs() > 0.01));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "run scripts/check-containers.sh to fetch public media fixtures"]
+    fn external_audio_seeks_with_video_and_keeps_the_video_end() -> Result<()> {
+        let fixtures = PathBuf::from(std::env::var_os("RIVPLAYER_FIXTURES").unwrap());
+        let video = LocalFile(fixtures.join("bear-1280x720-avt_subt_frag.mp4"));
+        let audio = LocalFile(fixtures.join("bbb-320x240-2video-2audio.mp4"));
+        for position in [0.0, 1.25] {
+            let mut info = None;
+            let mut first_audio = None;
+            let mut first_video = None;
+            let mut end = None;
+            run_session(
+                &video,
+                Some(&audio),
+                Options {
+                    position,
+                    mode: DecodeMode::Software,
+                    ..Options::default()
+                },
+                &AtomicBool::new(false),
+                false,
+                |event| {
+                    match event {
+                        Event::Info(value) => info = Some(value),
+                        Event::Audio(chunk) => {
+                            first_audio.get_or_insert(chunk.time);
+                        }
+                        Event::Video(frame) => {
+                            first_video.get_or_insert(frame.time);
+                        }
+                        Event::End(time) => end = Some(time),
+                        _ => {}
+                    }
+                    true
+                },
+            )?;
+            let info = info.unwrap();
+            assert!(info.current_audio.is_none() && !info.audio.is_empty());
+            assert_eq!(
+                info.external_audio
+                    .as_ref()
+                    .map(|track| track.codec.as_str()),
+                Some("aac")
+            );
+            for first in [first_audio.unwrap(), first_video.unwrap()] {
+                assert!(
+                    (position - 0.002..position + 0.12).contains(&first),
+                    "{position} -> {first}"
+                );
+            }
+            assert!((2.55..3.0).contains(&end.unwrap()), "{end:?}");
+        }
+        let missing = LocalFile(fixtures.join("missing-external.flac"));
+        let mut restored = false;
+        let mut warned = false;
+        run_session(
+            &video,
+            Some(&missing),
+            Options {
+                mode: DecodeMode::Software,
+                ..Options::default()
+            },
+            &AtomicBool::new(false),
+            false,
+            |event| {
+                match event {
+                    Event::Info(info) => {
+                        restored = info.current_audio.is_some() && info.external_audio.is_none()
+                    }
+                    Event::Notice(message) => warned = message.starts_with("External audio:"),
+                    _ => {}
+                }
+                !(restored && warned)
+            },
+        )?;
+        assert!(restored && warned);
+        Ok(())
+    }
 }

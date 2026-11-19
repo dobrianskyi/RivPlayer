@@ -1,9 +1,10 @@
 [package]
-name = "rvideoplayer"
+name = "rivplayer"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
-description = "Native Linux video player"
+description = "Native Linux media player with built-in decoders"
+repository = "https://github.com/dobrianskyi/RivPlayer"
 
 [features]
 default = ["vaapi"]
@@ -49,6 +50,8 @@ veloce-mpegts = "0.1.7"
 wsola = "0.3"
 winit = { version = "0.30", default-features = false, features = ["x11"] }
 x11rb = "0.13"
+zbus = { version = "6.2.1", default-features = false, features = ["default-rt", "service"] }
+async-channel = "2"
 
 [patch.crates-io]
 # Backports positioned Wayland file drops to the Winit 0.30 API used by eframe.

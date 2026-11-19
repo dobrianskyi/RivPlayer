@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -61,10 +61,65 @@ struct RepeatPreroll {
 }
 
 struct Session {
-    frames: Receiver<TimedPicture>,
+    frames: Receiver<QueuedPicture>,
+    frame_budget: Arc<FrameBudget>,
     audio: Option<Receiver<AudioChunk>>,
     events: Receiver<Notice>,
     cancel: Arc<AtomicBool>,
+}
+
+const FRAME_QUEUE_BYTES: usize = 48 * 1024 * 1024;
+
+#[derive(Default)]
+struct FrameBudget {
+    used: Mutex<usize>,
+    freed: Condvar,
+}
+
+impl FrameBudget {
+    fn reserve(self: &Arc<Self>, bytes: usize, cancel: &AtomicBool) -> Option<FrameReservation> {
+        let used = self.used.lock().unwrap();
+        // An oversized frame must be able to pass through an otherwise empty queue.
+        let mut used = self
+            .freed
+            .wait_while(used, |used| {
+                !cancel.load(Ordering::Relaxed)
+                    && *used != 0
+                    && bytes > FRAME_QUEUE_BYTES.saturating_sub(*used)
+            })
+            .unwrap();
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        *used += bytes;
+        Some(FrameReservation {
+            budget: self.clone(),
+            bytes,
+        })
+    }
+
+    fn cancel(&self, cancel: &AtomicBool) {
+        let _used = self.used.lock().unwrap();
+        cancel.store(true, Ordering::Relaxed);
+        self.freed.notify_one();
+    }
+}
+
+struct FrameReservation {
+    budget: Arc<FrameBudget>,
+    bytes: usize,
+}
+
+impl Drop for FrameReservation {
+    fn drop(&mut self) {
+        *self.budget.used.lock().unwrap() -= self.bytes;
+        self.budget.freed.notify_one();
+    }
+}
+
+struct QueuedPicture {
+    picture: TimedPicture,
+    _reservation: FrameReservation,
 }
 
 enum Notice {
@@ -74,13 +129,14 @@ enum Notice {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        self.frame_budget.cancel(&self.cancel);
     }
 }
 
 impl Session {
     fn spawn(
         source: Arc<dyn MediaSource>,
+        external_audio: Option<PathBuf>,
         options: Options,
         rate: f64,
         load_sidecar: bool,
@@ -91,6 +147,8 @@ impl Session {
         let (tx, events) = unbounded();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
+        let frame_budget = Arc::new(FrameBudget::default());
+        let worker_budget = frame_budget.clone();
         thread::Builder::new()
             .name("media-decoder".into())
             .spawn(move || {
@@ -112,15 +170,35 @@ impl Session {
                         }
                     }
                 };
+                let external = external_audio.map(crate::source::LocalFile);
                 let result = pipeline::run_session(
                     source.as_ref(),
+                    external.as_ref().map(|source| source as &dyn MediaSource),
                     options,
                     &worker_cancel,
                     load_sidecar,
                     |event| {
                         match event {
                             Event::Video(picture) => {
-                                if frame_tx.send(picture).is_err() {
+                                let bytes = picture
+                                    .picture
+                                    .frame
+                                    .planes
+                                    .iter()
+                                    .map(|p| p.data.capacity())
+                                    .sum();
+                                let Some(reservation) =
+                                    worker_budget.reserve(bytes, &worker_cancel)
+                                else {
+                                    return false;
+                                };
+                                if frame_tx
+                                    .send(QueuedPicture {
+                                        picture,
+                                        _reservation: reservation,
+                                    })
+                                    .is_err()
+                                {
                                     return false;
                                 }
                                 if frame_tx.len() == 1 {
@@ -179,6 +257,7 @@ impl Session {
             })?;
         Ok(Self {
             frames,
+            frame_budget,
             audio: Some(audio),
             events,
             cancel,
@@ -191,6 +270,8 @@ impl Session {
 pub struct Player {
     wake: Arc<dyn Fn() + Send + Sync>,
     source: Option<Arc<dyn MediaSource>>,
+    external_audio: Option<PathBuf>,
+    external_audio_confirmed: bool,
     session: Option<Session>,
     audio: Option<AudioOutput>,
     retiring_audio: Option<Receiver<()>>,
@@ -202,7 +283,7 @@ pub struct Player {
     preroll: bool,
     decoded_end: Option<f64>,
     reached_end: bool,
-    next_frame: Option<TimedPicture>,
+    next_frame: Option<QueuedPicture>,
     embedded: HashMap<u32, VecDeque<Cue>>,
     sidecar: Option<Sidecar>,
     pending_sidecar: Option<Receiver<anyhow::Result<(PathBuf, Sidecar)>>>,
@@ -228,6 +309,8 @@ impl Player {
         Self {
             wake: Arc::new(wake),
             source: None,
+            external_audio: None,
+            external_audio_confirmed: false,
             session: None,
             audio: None,
             retiring_audio: None,
@@ -300,7 +383,21 @@ impl Player {
         video: Option<u32>,
         audio: Option<u32>,
     ) {
+        self.open_with_audio(source, position, playing, video, audio, None);
+    }
+
+    pub fn open_with_audio(
+        &mut self,
+        source: Arc<dyn MediaSource>,
+        position: f64,
+        playing: bool,
+        video: Option<u32>,
+        audio: Option<u32>,
+        external_audio: Option<PathBuf>,
+    ) {
         self.source = Some(source);
+        self.external_audio = external_audio;
+        self.external_audio_confirmed = false;
         self.info = None;
         self.notice = None;
         self.sidecar = None;
@@ -345,6 +442,7 @@ impl Player {
             let load_sidecar = self.sidecar.is_none() && self.pending_sidecar.is_none();
             match Session::spawn(
                 source.clone(),
+                self.external_audio.clone(),
                 self.options,
                 rate,
                 load_sidecar,
@@ -412,6 +510,7 @@ impl Player {
             && let Some(source) = &self.source
             && let Ok(session) = Session::spawn(
                 source.clone(),
+                self.external_audio.clone(),
                 Options {
                     position: range.start,
                     ..self.options
@@ -536,8 +635,30 @@ impl Player {
     }
 
     pub fn select_audio(&mut self, index: u32) {
+        self.external_audio = None;
+        self.external_audio_confirmed = false;
+        self.notice = None;
         self.options.audio = Some(index);
         self.restart(self.position());
+    }
+
+    pub fn select_external_audio(&mut self, path: Option<PathBuf>) {
+        if self.has_source() && self.external_audio != path {
+            self.external_audio = path;
+            self.external_audio_confirmed = false;
+            self.notice = None;
+            self.restart(self.position());
+        }
+    }
+
+    pub fn external_audio_path(&self) -> Option<&Path> {
+        self.external_audio.as_deref()
+    }
+
+    pub fn active_external_audio_path(&self) -> Option<&Path> {
+        self.external_audio
+            .as_deref()
+            .filter(|_| self.external_audio_confirmed)
     }
 
     pub fn set_volume(&mut self, volume: f32) {
@@ -760,11 +881,15 @@ impl Player {
             match event {
                 Notice::Pipeline(Event::Info(info)) => {
                     self.options.video = info.current_video;
-                    self.options.audio = info.current_audio;
+                    self.external_audio_confirmed = info.external_audio.is_some();
+                    if info.external_audio.is_none() {
+                        self.external_audio = None;
+                        self.options.audio = info.current_audio;
+                    }
                     self.options.track_fallback = false;
                     let rx = self.session.as_mut().and_then(|s| s.audio.take());
                     if self.wants_play
-                        && info.current_audio.is_some()
+                        && (info.current_audio.is_some() || info.external_audio.is_some())
                         && let Some(rx) = rx
                     {
                         match AudioOutput::open(rx, self.clock.clone()) {
@@ -831,15 +956,15 @@ impl Player {
                 clock.start = Some(Instant::now() + Duration::from_millis(35));
                 time = clock.position;
             } else {
-                frame = self.next_frame.take();
+                frame = self.next_frame.take().map(|p| p.picture);
             }
         }
         while self
             .next_frame
             .as_ref()
-            .is_some_and(|p| self.wants_play && p.time <= time + 0.006)
+            .is_some_and(|p| self.wants_play && p.picture.time <= time + 0.006)
         {
-            frame = self.next_frame.take();
+            frame = self.next_frame.take().map(|p| p.picture);
             self.next_frame = session.frames.try_recv().ok();
         }
         if let Some(end) = self.decoded_end
@@ -863,13 +988,63 @@ impl Player {
         if !self.wants_play {
             return None;
         }
-        let seconds = self
-            .next_frame
-            .as_ref()
-            .map_or(0.04, |f| (f.time - self.position() - 0.012) / self.rate());
+        let seconds = self.next_frame.as_ref().map_or(0.04, |f| {
+            (f.picture.time - self.position() - 0.012) / self.rate()
+        });
         let seconds = self.repeat.map_or(seconds, |range| {
             seconds.min((range.end - self.position()) / self.rate())
         });
         Some(Duration::from_secs_f64(seconds.clamp(0.002, 0.04)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_budget_resumes_after_release_and_wakes_on_cancel() {
+        let budget = Arc::new(FrameBudget::default());
+        let cancel = AtomicBool::new(false);
+        let first = budget.reserve(FRAME_QUEUE_BYTES / 2, &cancel).unwrap();
+        let second = budget.reserve(FRAME_QUEUE_BYTES / 2, &cancel).unwrap();
+        thread::scope(|scope| {
+            let (sent, result) = bounded(1);
+            let budget = &budget;
+            let cancel = &cancel;
+            scope.spawn(move || {
+                let _ = sent.send(budget.reserve(1, cancel));
+            });
+            assert!(result.recv_timeout(Duration::from_millis(20)).is_err());
+            drop(first);
+            assert!(
+                result
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .is_some()
+            );
+        });
+        drop(second);
+
+        let oversized = budget.reserve(FRAME_QUEUE_BYTES + 1, &cancel).unwrap();
+        thread::scope(|scope| {
+            let (sent, result) = bounded(1);
+            let budget = &budget;
+            let cancel = &cancel;
+            scope.spawn(move || {
+                let _ = sent.send(budget.reserve(1, cancel));
+            });
+            let was_blocked = result.recv_timeout(Duration::from_millis(20)).is_err();
+            budget.cancel(cancel);
+            assert!(was_blocked);
+            assert!(
+                result
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        drop(oversized);
+        assert_eq!(*budget.used.lock().unwrap(), 0);
     }
 }

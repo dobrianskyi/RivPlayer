@@ -9,7 +9,7 @@ use eframe::egui::{
     self, Align2, Color32, FontId, Id, LayerId, Order, Painter, PointerButton, Pos2, Rect, Sense,
     Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2, pos2, vec2,
 };
-use rvideoplayer::{engine, source::LocalFile};
+use rivplayer::{engine, source::LocalFile};
 
 use super::{
     controls::{Icon, draw, timestamp},
@@ -28,6 +28,7 @@ pub enum Edit {
     Open(i64, PathBuf),
     Reveal(PathBuf),
     Remove(i64, PathBuf),
+    Clear,
     Favorite(PathBuf, bool),
     Reorder(i64, Option<i64>),
     Time(TimeAction),
@@ -371,6 +372,17 @@ impl Rows {
                                 entries.get(i + 2).map(|next| next.id),
                             ));
                             ui.close();
+                        }
+                        if let Some(label) = match list {
+                            List::History => Some("Clear all history"),
+                            List::Playlist(_) => Some("Clear all playlist"),
+                            List::Favorites => None,
+                        } {
+                            ui.separator();
+                            if ui.button(label).clicked() {
+                                edit = Some(Edit::Clear);
+                                ui.close();
+                            }
                         }
                     });
                     if !grip.hovered() && !remove.hovered() && !whole.context_menu_opened() {

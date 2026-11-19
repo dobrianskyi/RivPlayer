@@ -2,7 +2,7 @@ use std::path::Path;
 
 use eframe::egui::{self, Color32, Frame, Id, RichText, Stroke, vec2};
 use oxideav_core::{ColorRange, ColorSignal, PixelFormat};
-use rvideoplayer::engine::{Picture, Player, Track};
+use rivplayer::engine::{Picture, Player, Track};
 
 use super::{
     controls::{Icon, PANEL_BACKGROUND, PANEL_BORDER, action_icon, timestamp},
@@ -27,8 +27,6 @@ pub enum SettingsTab {
     General,
     Playback,
     Display,
-    Audio,
-    About,
 }
 
 pub struct Inputs<'a> {
@@ -90,8 +88,6 @@ pub fn show(
                         ui.selectable_value(tab, SettingsTab::Controls, "Controls");
                         ui.selectable_value(tab, SettingsTab::Playback, "Playback");
                         ui.selectable_value(tab, SettingsTab::Display, "Display");
-                        ui.selectable_value(tab, SettingsTab::Audio, "Audio");
-                        ui.selectable_value(tab, SettingsTab::About, "About");
                     });
                     ui.separator();
                     ui.add_space(9.0);
@@ -102,7 +98,6 @@ pub fn show(
                         .show(ui, |ui| match tab {
                             SettingsTab::Controls => show_controls(ui, inputs.mouse),
                             SettingsTab::General => show_general(ui, inputs.clock_size),
-                            SettingsTab::About => show_about(ui),
                             _ => {
                                 ui.weak("Reserved for future settings.");
                                 ui.add_space((bounds.y - 145.0).clamp(6.0, 88.0));
@@ -168,33 +163,6 @@ fn show_controls(ui: &mut egui::Ui, mouse: &mut MouseSettings) {
     ui.weak("Scroll up over the video to seek forward and down to seek back.");
 }
 
-fn show_about(ui: &mut egui::Ui) {
-    ui.heading("RVideoPlayer");
-    ui.weak(concat!(
-        "Native Linux media player · ",
-        env!("CARGO_PKG_VERSION")
-    ));
-    ui.add_space(11.0);
-    section(
-        ui,
-        "Playback formats",
-        &[
-            (
-                "Video",
-                "H.264 (AVC), H.265 (HEVC), AV1, VP8, VP9, MPEG-1/2 Video, MPEG-4 Part 2, Theora".into(),
-            ),
-            ("Audio", "AAC-LC, AC-3, E-AC-3, DTS Core (MKV), ALAC, Opus, MP3, MP2, FLAC, Vorbis, PCM".into()),
-            (
-                "Containers",
-                "MP4 (including fragmented), MKV, WebM, MOV, AVI, MPEG-TS / M2TS, MPEG-1 System, MPEG-PS, M4V, FLV, Ogg / OGV, 3GP".into(),
-            ),
-            ("Audio files", "MP3, FLAC, AC-3, E-AC-3".into()),
-            ("Subtitles", "SRT, WebVTT, ASS/SSA (text), PGS (.sup), VobSub (.idx + .sub)".into()),
-        ],
-    );
-    ui.weak("Playback support depends on the combination of container and codecs.");
-}
-
 fn show_information(
     ui: &mut egui::Ui,
     path: Option<&Path>,
@@ -203,7 +171,11 @@ fn show_information(
 ) {
     let info = player.info.as_deref();
     let video = info.and_then(|i| i.video.iter().find(|t| Some(t.index) == i.current_video));
-    let audio = info.and_then(|i| i.audio.iter().find(|t| Some(t.index) == i.current_audio));
+    let audio = info.and_then(|i| {
+        i.external_audio
+            .as_ref()
+            .or_else(|| i.audio.iter().find(|t| Some(t.index) == i.current_audio))
+    });
     let video_details = video.and_then(|track| track.video.as_ref());
     let duration = player
         .duration()
